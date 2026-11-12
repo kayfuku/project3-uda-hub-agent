@@ -14,7 +14,8 @@ from sqlalchemy.orm.decl_api import DeclarativeBase
 from sqlalchemy.sql import func
 
 
-Base:DeclarativeBase = declarative_base()
+Base: DeclarativeBase = declarative_base()
+
 
 class Account(Base):
     __tablename__ = 'accounts'
@@ -35,7 +36,8 @@ class User(Base):
     __tablename__ = 'users'
 
     user_id = Column(String, primary_key=True)
-    account_id = Column(String, ForeignKey('accounts.account_id'), nullable=False)
+    account_id = Column(String, ForeignKey(
+        'accounts.account_id'), nullable=False)
     external_user_id = Column(String, nullable=False)
     user_name = Column(String, nullable=False)
     created_at = Column(DateTime, default=func.now())
@@ -45,25 +47,27 @@ class User(Base):
     tickets = relationship("Ticket", back_populates="user")
 
     __table_args__ = (
-        UniqueConstraint('account_id', 'external_user_id', name='uq_user_external_per_account'),
+        UniqueConstraint('account_id', 'external_user_id',
+                         name='uq_user_external_per_account'),
     )
 
     def __repr__(self):
         return f"<User(user_id='{self.user_id}', user_name='{self.user_name}', external_user_id='{self.external_user_id}')>"
 
 
-
 class Ticket(Base):
     __tablename__ = 'tickets'
     ticket_id = Column(String, primary_key=True)
-    account_id = Column(String, ForeignKey('accounts.account_id'), nullable=False)
+    account_id = Column(String, ForeignKey(
+        'accounts.account_id'), nullable=False)
     user_id = Column(String, ForeignKey('users.user_id'), nullable=False)
     channel = Column(String)
     created_at = Column(DateTime, default=func.now())
 
     account = relationship("Account", back_populates="tickets")
     user = relationship("User", back_populates="tickets")
-    ticket_metadata = relationship("TicketMetadata", uselist=False, back_populates="ticket")
+    ticket_metadata = relationship(
+        "TicketMetadata", uselist=False, back_populates="ticket")
     messages = relationship("TicketMessage", back_populates="ticket")
 
     def __repr__(self):
@@ -72,7 +76,8 @@ class Ticket(Base):
 
 class TicketMetadata(Base):
     __tablename__ = 'ticket_metadata'
-    ticket_id = Column(String, ForeignKey('tickets.ticket_id'), primary_key=True)
+    ticket_id = Column(String, ForeignKey(
+        'tickets.ticket_id'), primary_key=True)
     status = Column(String, nullable=False)
     main_issue_type = Column(String)
     tags = Column(Text)
@@ -103,14 +108,16 @@ class TicketMessage(Base):
     ticket = relationship("Ticket", back_populates="messages")
 
     def __repr__(self):
-        short_content = (self.content[:30] + "...") if self.content and len(self.content) > 30 else self.content
+        short_content = (
+            self.content[:30] + "...") if self.content and len(self.content) > 30 else self.content
         return f"<TicketMessage(message_id='{self.message_id}', role='{self.role.name}', content='{short_content}')>"
 
 
 class Knowledge(Base):
     __tablename__ = 'knowledge'
     article_id = Column(String, primary_key=True)
-    account_id = Column(String, ForeignKey('accounts.account_id'), nullable=False)
+    account_id = Column(String, ForeignKey(
+        'accounts.account_id'), nullable=False)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
     tags = Column(Text)

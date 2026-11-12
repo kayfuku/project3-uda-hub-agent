@@ -26,7 +26,8 @@ class User(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-    subscription = relationship("Subscription", back_populates="user", uselist=False)
+    subscription = relationship(
+        "Subscription", back_populates="user", uselist=False)
     reservations = relationship("Reservation", back_populates="user")
 
     def __repr__(self):
@@ -37,7 +38,8 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     subscription_id = Column(String, primary_key=True)
-    user_id = Column(String, ForeignKey("users.user_id"), unique=True, nullable=False)
+    user_id = Column(String, ForeignKey("users.user_id"),
+                     unique=True, nullable=False)
     status = Column(String, nullable=False)
     tier = Column(String, nullable=False)
     monthly_quota = Column(Integer, nullable=False)
@@ -76,7 +78,8 @@ class Reservation(Base):
 
     reservation_id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.user_id"), nullable=False)
-    experience_id = Column(String, ForeignKey("experiences.experience_id"), nullable=False)
+    experience_id = Column(String, ForeignKey(
+        "experiences.experience_id"), nullable=False)
     status = Column(String, nullable=False)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
@@ -86,4 +89,3 @@ class Reservation(Base):
 
     def __repr__(self):
         return f"<Reservation(reservation_id='{self.reservation_id}', user_id='{self.user_id}', experience_id='{self.experience_id}', status='{self.status}')>"
-
