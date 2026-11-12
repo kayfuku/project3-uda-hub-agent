@@ -12,6 +12,7 @@ venv.bak/
 .DS_Store
 CLAUDE.md
 references
+instructions
 
 # Virtual Environment
 bin/
