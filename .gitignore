@@ -10,6 +10,7 @@ ENV/
 env.bak/
 venv.bak/
 .DS_Store
+CLAUDE.md/
 
 # Virtual Environment
 bin/
