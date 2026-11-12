@@ -6,12 +6,13 @@ from sqlalchemy.ext.declarative import declarative_base
 from contextlib import contextmanager
 from langchain_core.messages import (
     SystemMessage,
-    HumanMessage, 
+    HumanMessage,
 )
 from langgraph.graph.state import CompiledStateGraph
 
 
 Base = declarative_base()
+
 
 def reset_db(db_path: str, echo: bool = True):
     """Drops the existing udahub.db file and recreates all tables."""
@@ -48,9 +49,10 @@ def model_to_dict(instance):
         for column in instance.__table__.columns
     }
 
-def chat_interface(agent:CompiledStateGraph, ticket_id:str):
+
+def chat_interface(agent: CompiledStateGraph, ticket_id: str):
     is_first_iteration = False
-    messages = [SystemMessage(content = f"ThreadId: {ticket_id}")]
+    messages = [SystemMessage(content=f"ThreadId: {ticket_id}")]
     while True:
         user_input = input("User: ")
         print("User:", user_input)
@@ -68,7 +70,7 @@ def chat_interface(agent:CompiledStateGraph, ticket_id:str):
                 "thread_id": ticket_id,
             }
         }
-        
+
         result = agent.invoke(input=trigger, config=config)
         print("Assistant:", result["messages"][-1].content)
         is_first_iteration = False
