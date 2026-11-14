@@ -8,7 +8,12 @@
 ここでは、それをノードとして並べ、条件付きエッジでつなぐだけにする。
 
 load_memory と save_memory は補助ノード（エージェントではない）。udahub.db の長期メモリを読み書きする。
+
+ログ（logs/workflow.jsonl）は、このファイルだけで書く。エージェントのコードには入れず、
+「エージェントを呼んでログを 1 行書く」小さな関数（classifier_step など）でノードを包む。
 """
+import json
+
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +22,7 @@ from agentic.agents.account import account_node, account_tools_node
 from agentic.agents.classifier import classifier_node
 from agentic.agents.escalation import escalation_node
 from agentic.agents.knowledge import knowledge_node
+from agentic.logging_utils import log_event
 from agentic.state import SupportState
 from agentic.tools.memory import (
     create_ticket,
@@ -43,7 +49,7 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
     """
     ticket_id = config["configurable"]["thread_id"]
 
-    user_id, ticket_metadata, past_context = "", {}, ""
+    user_id, ticket_metadata, past_context, past_tickets = "", {}, "", 0
     info = get_ticket_info(ticket_id)
     if info["ok"]:
         data = info["data"]
@@ -53,6 +59,10 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
         past = load_past_context(user_id, current_ticket_id=ticket_id)
         if past["ok"]:
             past_context = past["data"]["summary"]
+            past_tickets = len(past["data"]["tickets"])
+
+    log_event(ticket_id, "load_memory", "memory_loaded", user_id=user_id,
+              past_tickets=past_tickets, error=None if info["ok"] else info["error"])
 
     return {
         "ticket_id": ticket_id,
@@ -80,24 +90,78 @@ def save_memory_node(state: SupportState) -> dict:
     """
     ticket_id = state["ticket_id"]
 
+    results = []  # DB の関数の結果（エラーをログに残すため）
+
     # 同じ発言は message.id で飛ばすので、毎ターン全部渡してよい
-    save_messages(ticket_id, state["messages"])
+    results.append(save_messages(ticket_id, state["messages"]))
 
     if state.get("resolution") == "escalated" and state.get("handoff_summary"):
-        save_handoff_summary(ticket_id, state["handoff_summary"])
+        results.append(save_handoff_summary(
+            ticket_id, state["handoff_summary"]))
 
     status = state.get("resolution") or "open"
     info = get_ticket_info(ticket_id)
     if info["ok"] and info["data"]["status"] == "escalated":
         status = "escalated"
 
-    update_ticket_status(
+    results.append(update_ticket_status(
         ticket_id,
         status,
         main_issue_type=state.get("category") or None,
         tags=f"urgency:{state['urgency']}" if state.get("urgency") else None,
-    )
+    ))
+
+    errors = [r["error"] for r in results if not r["ok"]]
+    log_event(ticket_id, "save_memory", "saved", status=status,
+              resolution=state.get("resolution"), errors=errors)
     return {}
+
+
+# ---------------------------------------------------------------
+# エージェントのノード（エージェントを呼び、ログを 1 行書く）
+# ---------------------------------------------------------------
+def classifier_step(state: SupportState) -> dict:
+    update = classifier_node(state)
+    log_event(state["ticket_id"], "classifier", "classified",
+              category=update["category"], urgency=update["urgency"],
+              reason=update["classification_reason"])
+    return update
+
+
+def knowledge_step(state: SupportState) -> dict:
+    update = knowledge_node(state)
+    articles = update.get("retrieved_articles", [])
+    log_event(state["ticket_id"], "knowledge", "retrieved",
+              top_article=articles[0]["title"] if articles else None,
+              confidence=update.get("confidence"),
+              escalation_reason=update.get("escalation_reason"))
+    return update
+
+
+def account_step(state: SupportState) -> dict:
+    update = account_node(state)
+    messages = update.get("messages", [])
+    log_event(state["ticket_id"], "account", "account_step",
+              tool_calls=[c["name"]
+                          for c in messages[-1].tool_calls] if messages else [],
+              escalation_reason=update.get("escalation_reason"))
+    return update
+
+
+def account_tools_step(state: SupportState) -> dict:
+    update = account_tools_node(state)
+    for message in update["messages"]:  # ツールごとに 1 行
+        result = json.loads(message.content)
+        log_event(state["ticket_id"], "account_tools", "tool_called",
+                  tool=message.name, ok=result["ok"], error=result.get("error"))
+    return update
+
+
+def escalation_step(state: SupportState) -> dict:
+    update = escalation_node(state)
+    log_event(state["ticket_id"], "escalation", "escalated",
+              reason=update["escalation_reason"], urgency=state.get("urgency"))
+    return update
 
 
 # ---------------------------------------------------------------
@@ -130,11 +194,11 @@ def build_graph(checkpointer=None):
     graph = StateGraph(SupportState)
 
     graph.add_node("load_memory", load_memory_node)
-    graph.add_node("classifier", classifier_node)
-    graph.add_node("knowledge", knowledge_node)
-    graph.add_node("account", account_node)
-    graph.add_node("account_tools", account_tools_node)
-    graph.add_node("escalation", escalation_node)
+    graph.add_node("classifier", classifier_step)
+    graph.add_node("knowledge", knowledge_step)
+    graph.add_node("account", account_step)
+    graph.add_node("account_tools", account_tools_step)
+    graph.add_node("escalation", escalation_step)
     graph.add_node("save_memory", save_memory_node)
 
     graph.add_edge(START, "load_memory")

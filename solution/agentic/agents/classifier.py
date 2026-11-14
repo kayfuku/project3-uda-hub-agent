@@ -43,6 +43,9 @@ category:
   Examples: "I was charged twice this month", "Can I get a refund?"
 - "account": the customer wants to look at or change their OWN data (reservations, subscription, account status).
   Examples: "Show my reservations", "Cancel my booking for next week", "Is my subscription active?"
+  Questions about the customer's OWN plan details (their tier, how many experiences THEY can use) are also "account",
+  because the quota differs per customer and only the account data has the correct number.
+  Examples: "How many experiences can I use per month on my plan?", "Which plan am I on?"
 - "escalation": a human must decide. Clear complaints, legal threats, or the customer asks for a human.
   Examples: "I want to talk to a manager", "I will contact my lawyer"
 
