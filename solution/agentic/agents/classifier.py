@@ -36,6 +36,8 @@ Read the customer's latest message and decide which agent should handle it.
 category:
 - "knowledge": general questions or how-to questions that do not need the customer's own data.
   Examples: "The QR code won't scan", "What does my subscription include?", "How do I change my payment method?"
+  Questions about charges, payments or refunds are also "knowledge", because the account tools have no billing data.
+  Examples: "I was charged twice this month", "Can I get a refund?"
 - "account": the customer wants to look at or change their OWN data (reservations, subscription, account status).
   Examples: "Show my reservations", "Cancel my booking for next week", "Is my subscription active?"
 - "escalation": a human must decide. Clear complaints, legal threats, or the customer asks for a human.

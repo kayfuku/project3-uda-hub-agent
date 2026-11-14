@@ -18,4 +18,5 @@ class SupportState(MessagesState):
     retrieved_articles: list[dict]    # 検索した記事とスコア
     confidence: float                 # Knowledge の信頼度
     escalation_reason: str | None     # エスカレーションの理由
+    handoff_summary: str              # 担当者向けの引き継ぎの要約（Escalation が書く）
     resolution: str                   # resolved / escalated
