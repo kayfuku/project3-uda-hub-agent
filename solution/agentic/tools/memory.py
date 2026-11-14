@@ -106,6 +106,39 @@ def create_ticket(external_user_id: str, channel: str = "chat") -> dict:
 # ---------------------------------------------------------------
 # 読み込み（load_memory ノード）
 # ---------------------------------------------------------------
+def get_ticket_info(ticket_id: str) -> dict:
+    """チケットの持ち主（CultPass の user_id）と metadata を返す。
+
+    load_memory が thread_id（= ticket_id）から user_id を知るために使う。
+    （chat_interface は messages しか渡さないため）
+
+    data の中身:
+        ticket_id, external_user_id, channel, created_at, status, main_issue_type, tags
+    """
+    if not ticket_id:
+        return _error("ticket_id is required")
+    if _db_missing():
+        return _error(f"UDA-Hub DB not found: {UDAHUB_DB_PATH}")
+
+    try:
+        with Session() as session:
+            ticket = session.get(udahub.Ticket, ticket_id)
+            if ticket is None:
+                return _error(f"Ticket not found: {ticket_id}")
+            meta = ticket.ticket_metadata
+            return _ok({
+                "ticket_id": ticket.ticket_id,
+                "external_user_id": ticket.user.external_user_id,
+                "channel": ticket.channel,
+                "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
+                "status": meta.status if meta else None,
+                "main_issue_type": meta.main_issue_type if meta else None,
+                "tags": meta.tags if meta else None,
+            })
+    except SQLAlchemyError as e:
+        return _error(f"Database error: {e}")
+
+
 def load_past_context(external_user_id: str, current_ticket_id: str | None = None,
                       limit: int = PAST_TICKET_LIMIT) -> dict:
     """同じユーザーの過去のチケットを新しい順に取り出し、短い文章にまとめる。
@@ -225,6 +258,37 @@ def save_messages(ticket_id: str, messages: list[BaseMessage]) -> dict:
 
             session.commit()
             return _ok({"ticket_id": ticket_id, "saved": count})
+    except SQLAlchemyError as e:
+        return _error(f"Database error: {e}")
+
+
+def save_handoff_summary(ticket_id: str, summary: str) -> dict:
+    """担当者向けの引き継ぎの要約を、ticket_messages に role=system で保存する。
+
+    お客さんとの会話（user / ai）とは役割を分けておく。
+    load_past_context は user と ai の発言しか読まないので、要約が past_context に混ざることはない。
+    """
+    if not ticket_id:
+        return _error("ticket_id is required")
+    if not summary or not summary.strip():
+        return _error("summary is required")
+    if _db_missing():
+        return _error(f"UDA-Hub DB not found: {UDAHUB_DB_PATH}")
+
+    try:
+        with Session() as session:
+            if session.get(udahub.Ticket, ticket_id) is None:
+                return _error(f"Ticket not found: {ticket_id}")
+            message = udahub.TicketMessage(
+                message_id=str(uuid.uuid4()),
+                ticket_id=ticket_id,
+                role=udahub.RoleEnum.system,
+                content=f"[Handoff] {summary.strip()}",
+                created_at=datetime.now(),
+            )
+            session.add(message)
+            session.commit()
+            return _ok({"ticket_id": ticket_id, "message_id": message.message_id})
     except SQLAlchemyError as e:
         return _error(f"Database error: {e}")
 

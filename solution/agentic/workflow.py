@@ -18,6 +18,7 @@ from agentic.agents.classifier import classifier_node
 from agentic.agents.escalation import escalation_node
 from agentic.agents.knowledge import knowledge_node
 from agentic.state import SupportState
+from agentic.tools.memory import create_ticket
 
 
 # ---------------------------------------------------------------
@@ -102,3 +103,16 @@ def build_graph(checkpointer=None):
 
 # 03_agentic_app.ipynb はこれを import する。短期メモリ = MemorySaver（thread_id ごと）
 orchestrator = build_graph(checkpointer=MemorySaver())
+
+
+def new_ticket(user_id: str, channel: str = "chat") -> str:
+    """新しい問い合わせのチケットを udahub.db に作り、ticket_id（= thread_id）を返す。
+
+    03 ノートブックでの使い方:
+        ticket_id = new_ticket("f1f10d")
+        chat_interface(orchestrator, ticket_id)
+    """
+    result = create_ticket(user_id, channel=channel)
+    if not result["ok"]:
+        raise ValueError(result["error"])
+    return result["data"]["ticket_id"]

@@ -189,3 +189,65 @@ def test_past_context_does_not_mix_users(db):
     finished_ticket("other-user", "Other user's question", "Other answer")
 
     assert memory.load_past_context(USER)["data"]["tickets"] == []
+
+
+# ---------------------------------------------------------------
+# get_ticket_info
+# ---------------------------------------------------------------
+def test_get_ticket_info_returns_owner_and_metadata(db):
+    """thread_id（= ticket_id）から、チケットの持ち主と metadata がわかる。"""
+    ticket_id = memory.create_ticket(USER, channel="email")["data"]["ticket_id"]
+
+    result = memory.get_ticket_info(ticket_id)
+
+    assert result["ok"] is True
+    assert result["data"]["external_user_id"] == USER
+    assert result["data"]["channel"] == "email"
+    assert result["data"]["status"] == "open"
+
+
+def test_get_ticket_info_unknown_ticket(db):
+    result = memory.get_ticket_info("no-such-ticket")
+    assert result == {"ok": False, "error": "Ticket not found: no-such-ticket"}
+
+
+def test_get_ticket_info_requires_ticket_id(db):
+    assert memory.get_ticket_info("") == {"ok": False, "error": "ticket_id is required"}
+
+
+# ---------------------------------------------------------------
+# save_handoff_summary
+# ---------------------------------------------------------------
+def test_save_handoff_summary_saves_system_message(db):
+    ticket_id = memory.create_ticket(USER)["data"]["ticket_id"]
+
+    result = memory.save_handoff_summary(ticket_id, "Customer reports a duplicate charge.")
+
+    assert result["ok"] is True
+    with db() as s:
+        rows = s.query(udahub.TicketMessage).filter_by(ticket_id=ticket_id).all()
+        assert len(rows) == 1
+        assert rows[0].role == udahub.RoleEnum.system
+        assert rows[0].content == "[Handoff] Customer reports a duplicate charge."
+
+
+def test_handoff_summary_is_not_in_past_context(db):
+    """要約は担当者向けなので、次回の past_context（お客さんとの会話の要約）には出てこない。"""
+    ticket_id = finished_ticket(USER, "I was charged twice", "We will forward this.",
+                                status="escalated")
+    memory.save_handoff_summary(ticket_id, "Duplicate charge, needs billing team.")
+
+    summary = memory.load_past_context(USER)["data"]["summary"]
+
+    assert "I was charged twice" in summary
+    assert "Handoff" not in summary
+
+
+def test_save_handoff_summary_rejects_empty_summary(db):
+    ticket_id = memory.create_ticket(USER)["data"]["ticket_id"]
+    assert memory.save_handoff_summary(ticket_id, "  ") == {"ok": False, "error": "summary is required"}
+
+
+def test_save_handoff_summary_unknown_ticket(db):
+    result = memory.save_handoff_summary("no-such-ticket", "summary")
+    assert result == {"ok": False, "error": "Ticket not found: no-such-ticket"}
