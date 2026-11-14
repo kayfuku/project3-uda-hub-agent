@@ -1,17 +1,17 @@
-"""ナレッジ記事の検索（RAG）。設計書（agentic/design/architecture.md）の第5章。
+"""Knowledge article search (RAG). Design doc (agentic/design/architecture.md), Chapter 5.
 
-LangChain の Chroma（langchain_chroma）を使う。
+Uses LangChain's Chroma (langchain_chroma).
 
-流れ:
-  【準備】udahub.db の knowledge テーブル → Document にする → Chroma に保存（空のときだけ）
-  【検索】similarity_search_with_score(質問) → 近い記事と cosine 距離
-          → 信頼度 = 1 − 1位の cosine 距離
+Flow:
+  [Setup]  udahub.db knowledge table -> Documents -> stored in Chroma (only when empty)
+  [Search] similarity_search_with_score(question) -> closest articles and cosine distances
+           -> confidence = 1 - cosine distance of the top article
 
-返り値の形は cultpass_tools.py と同じ {"ok": ..., "data"/"error": ...}。
+Return values have the same shape as cultpass_tools.py: {"ok": ..., "data"/"error": ...}.
 
-前提:
-- solution/ フォルダが sys.path に入っていること
-- 環境変数 VOCAREUM_API_KEY が設定されていること（呼び出す側で load_dotenv() しておく）
+Prerequisites:
+- the solution/ folder is on sys.path
+- the VOCAREUM_API_KEY environment variable is set (the caller runs load_dotenv())
 """
 import os
 from pathlib import Path
@@ -27,7 +27,7 @@ from sqlalchemy.orm import sessionmaker
 from data.models import udahub
 
 # ---------------------------------------------------------------
-# 設定
+# Settings
 # ---------------------------------------------------------------
 # solution/agentic/tools/knowledge_search.py → parents[2] = solution/
 SOLUTION_DIR = Path(__file__).resolve().parents[2]
@@ -36,12 +36,12 @@ CHROMA_DIR = SOLUTION_DIR / "data" / "core" / "chroma"
 
 COLLECTION_NAME = "knowledge"
 EMBEDDING_MODEL = "text-embedding-3-small"
-OPENAI_BASE_URL = "https://openai.vocareum.com/v1"  # Udacity（Vocareum）経由で OpenAI を使う
-# 実測（2026-11-14）: 関係ある質問 0.312〜0.659 / 関係ない質問 0.136〜0.253 → その間の 0.30
+OPENAI_BASE_URL = "https://openai.vocareum.com/v1"  # Use OpenAI via Udacity (Vocareum)
+# Measured (2026-11-14): relevant questions 0.312-0.659 / unrelated questions 0.136-0.253 -> 0.30 in between
 CONFIDENCE_THRESHOLD = 0.30
 TOP_K = 3
 
-# ベクトルストアは、最初に使うときに1回だけ作る
+# The vector store is created only once, on first use
 _vector_store = None
 
 
@@ -54,12 +54,12 @@ def _error(message: str) -> dict:
 
 
 # ---------------------------------------------------------------
-# 準備：記事の読み込みとインデックス作成
+# Setup: load articles and build the index
 # ---------------------------------------------------------------
 def load_articles() -> list[Document]:
-    """udahub.db の knowledge テーブルから記事を読み込み、Document のリストにする。
+    """Load articles from the knowledge table in udahub.db and turn them into a list of Documents.
 
-    page_content（埋め込まれる文字列）には、タイトル・タグ・本文をまとめて入れる。
+    page_content (the text that gets embedded) combines the title, tags, and body.
     """
     if not UDAHUB_DB_PATH.exists():
         raise FileNotFoundError(f"UDA-Hub DB not found: {UDAHUB_DB_PATH}")
@@ -77,7 +77,7 @@ def load_articles() -> list[Document]:
 
 
 def get_vector_store(rebuild: bool = False) -> Chroma:
-    """Chroma のベクトルストアを返す。空のとき（または rebuild=True のとき）は記事を登録する。"""
+    """Return the Chroma vector store. If it is empty (or rebuild=True), add the articles."""
     global _vector_store
 
     if _vector_store is None:
@@ -88,13 +88,13 @@ def get_vector_store(rebuild: bool = False) -> Chroma:
                 base_url=OPENAI_BASE_URL,
                 api_key=os.getenv("VOCAREUM_API_KEY"),
             ),
-            persist_directory=str(CHROMA_DIR),               # ディスクに保存する
-            collection_metadata={"hnsw:space": "cosine"},    # 距離は cosine（= 1 − コサイン類似度）
-            client_settings=Settings(anonymized_telemetry=False),  # 利用状況を外部に送らない
+            persist_directory=str(CHROMA_DIR),               # persist to disk
+            collection_metadata={"hnsw:space": "cosine"},    # cosine distance (= 1 - cosine similarity)
+            client_settings=Settings(anonymized_telemetry=False),  # do not send usage data externally
         )
 
     if rebuild:
-        # 記事を更新したときは、コレクションを空にして作り直す
+        # When articles are updated, clear the collection and rebuild it
         _vector_store.reset_collection()
 
     if not _vector_store.get(limit=1)["ids"]:
@@ -105,23 +105,23 @@ def get_vector_store(rebuild: bool = False) -> Chroma:
 
 
 # ---------------------------------------------------------------
-# 検索
+# Search
 # ---------------------------------------------------------------
 def search_knowledge(query: str, k: int = TOP_K) -> dict:
-    """質問に近い記事を k 件返す。
+    """Return the k articles closest to the question.
 
-    data の中身:
-        confidence   : 1位の記事のスコア（0〜1）
-        is_confident : confidence がしきい値以上か（False ならエスカレーション）
-        articles     : [{article_id, title, tags, content, score}, ...]（スコアの高い順）
+    Contents of data:
+        confidence   : score of the top article (0-1)
+        is_confident : whether confidence >= threshold (False means escalate)
+        articles     : [{article_id, title, tags, content, score}, ...] (highest score first)
     """
     if not query or not query.strip():
         return _error("query is required")
 
     try:
-        # 返ってくる score は「距離」（小さいほど近い）
+        # The returned score is a "distance" (smaller = closer)
         results = get_vector_store().similarity_search_with_score(query=query, k=k)
-    except Exception as e:  # DB がない、API エラーなど
+    except Exception as e:  # missing DB, API error, etc.
         return _error(f"Knowledge search failed: {e}")
 
     articles = [
@@ -130,7 +130,7 @@ def search_knowledge(query: str, k: int = TOP_K) -> dict:
             "title": doc.metadata["title"],
             "tags": doc.metadata["tags"],
             "content": doc.page_content,
-            "score": round(1 - distance, 4),  # cosine 距離 → 類似度
+            "score": round(1 - distance, 4),  # cosine distance -> similarity
         }
         for doc, distance in results
     ]
@@ -144,10 +144,10 @@ def search_knowledge(query: str, k: int = TOP_K) -> dict:
 
 
 # ---------------------------------------------------------------
-# ラッパー（LangChain の @tool）。cultpass_tools.py と同じ形。
-# - LLM に見える名前は本体と同じ "search_knowledge"
-# - k は LLM に選ばせず、TOP_K（3件）で固定する
-# - docstring がそのまま LLM 向けのツール説明になるので、英語で書く
+# Wrapper (LangChain @tool). Same pattern as cultpass_tools.py.
+# - The name the LLM sees is "search_knowledge", same as the core function
+# - k is not chosen by the LLM; it is fixed to TOP_K (3)
+# - The docstring becomes the tool description for the LLM, so it is written in English
 # ---------------------------------------------------------------
 @tool("search_knowledge", parse_docstring=True)
 def search_knowledge_tool(query: str) -> dict:

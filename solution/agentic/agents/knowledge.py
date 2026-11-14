@@ -1,13 +1,13 @@
-"""Knowledge Agent。設計書の 3.2 節と第5章。
+"""Knowledge Agent. Design doc, Section 3.2 and Chapter 5.
 
-ナレッジ記事を検索し、記事の内容だけに基づいて回答する。
+Searches the knowledge articles and answers based only on their content.
 
-  ① search_knowledge(最新のユーザーメッセージ) → confidence と上位 3 件
-  ② 検索の失敗、または is_confident が False → 回答は作らず、escalation_reason を入れて返す
-  ③ True → 上位 3 件を LLM に渡して回答させる（構造化出力）
-     記事が人への引き継ぎを指示しているときは、LLM が needs_escalation=True を返す
+  (1) search_knowledge(latest user message) -> confidence and top 3 articles
+  (2) search failed, or is_confident is False -> no answer; return with escalation_reason set
+  (3) True -> pass the top 3 articles to the LLM to answer (structured output)
+      If an article says to hand off to a human, the LLM returns needs_escalation=True
 
-エスカレーションに進むかどうかは、返した escalation_reason を見てグラフ側（workflow.py）で決める。
+Whether to escalate is decided by the graph (workflow.py) based on the returned escalation_reason.
 """
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ from agentic.tools.knowledge_search import CONFIDENCE_THRESHOLD, search_knowledg
 
 
 class KnowledgeAnswer(BaseModel):
-    """Knowledge Agent の LLM の出力。"""
+    """LLM output of the Knowledge Agent."""
     answer: str = Field(
         description="The reply to the customer, based only on the articles.")
     used_article_titles: list[str] = Field(
@@ -48,7 +48,7 @@ Answer ONLY with information from the help-center articles below. Do not invent 
 
 
 def _format_articles(articles: list[dict]) -> str:
-    """検索した記事を、LLM に渡す文字列にする。"""
+    """Format the retrieved articles as a string for the LLM."""
     return "\n\n".join(
         f"[Article {i}] (score {a['score']})\n{a['content']}"
         for i, a in enumerate(articles, start=1)
@@ -56,10 +56,10 @@ def _format_articles(articles: list[dict]) -> str:
 
 
 def knowledge_node(state: SupportState) -> dict:
-    """記事を検索して回答し、State に書き込む項目だけを返す。"""
+    """Search the articles, answer, and return only the fields to write to the State."""
     question = _latest_user_message(state)
 
-    # ① 検索
+    # (1) Search
     result = search_knowledge(question)
     if not result["ok"]:
         return {
@@ -69,13 +69,13 @@ def knowledge_node(state: SupportState) -> dict:
         }
 
     data = result["data"]
-    # State には本文を入れず、タイトルとスコアだけ残す（ログやテストで確認するため）
+    # Keep only titles and scores in the State, not the body (for checking in logs and tests)
     retrieved = [
         {"article_id": a["article_id"], "title": a["title"], "score": a["score"]}
         for a in data["articles"]
     ]
 
-    # ② 信頼度が低い → 回答を作らずにエスカレーション
+    # (2) Low confidence -> escalate without answering
     if not data["is_confident"]:
         return {
             "confidence": data["confidence"],
@@ -85,7 +85,7 @@ def knowledge_node(state: SupportState) -> dict:
             ),
         }
 
-    # ③ 記事をもとに LLM が回答する
+    # (3) The LLM answers based on the articles
     user_prompt = (
         f"Past context: {state.get('past_context') or 'None'}\n\n"
         f"Help-center articles:\n{_format_articles(data['articles'])}\n\n"
@@ -103,7 +103,7 @@ def knowledge_node(state: SupportState) -> dict:
         "retrieved_articles": retrieved,
     }
     if answer.needs_escalation:
-        # 案内は返したうえで、人に引き継ぐ
+        # Return the guidance and also hand off to a human
         update["escalation_reason"] = answer.escalation_reason or "Article requires a human"
     else:
         update["escalation_reason"] = None

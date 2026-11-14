@@ -1,15 +1,15 @@
-"""Escalation Agent。設計書の 3.4 節。
+"""Escalation Agent. Design doc, Section 3.4.
 
-人間の担当者に引き継ぐ。担当者がすぐ対応できるよう、要約を残す。
+Hands off to a human agent, leaving a summary so they can act right away.
 
-  入力: 会話全体、escalation_reason（なければ classification_reason）、urgency、
-        このターンで先に出した案内（あれば、コードで customer_message の前につなぐ）
-  出力: customer_message（お客さん向け。お客さんの言語）
-        handoff_summary（担当者向け。英語）
-  返す項目: {"messages": [...], "handoff_summary": ..., "resolution": "escalated"}
+  Input:   full conversation, escalation_reason (or classification_reason if missing), urgency,
+           any guidance already given this turn (if present, the code prepends it to customer_message)
+  Output:  customer_message (for the customer, in the customer's language)
+           handoff_summary (for the human agent, in English)
+  Returns: {"messages": [...], "handoff_summary": ..., "resolution": "escalated"}
 
-DB への書き込み（status を escalated にするなど）は、このノードでは行わない。
-DB に書く場所は save_memory（workflow.py）の 1 か所にまとめる。
+This node does not write to the DB (e.g. setting status to escalated).
+All DB writes are kept in one place: save_memory (workflow.py).
 """
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
@@ -20,10 +20,10 @@ from agentic.state import SupportState
 
 
 class EscalationOutput(BaseModel):
-    """Escalation Agent の LLM の出力。
+    """LLM output of the Escalation Agent.
 
-    customer_language を最初に答えさせて、返信の言語を先に決めさせる
-    （これがないと、英語の問い合わせにスペイン語で返すことがあった）。
+    customer_language is answered first so the reply language is decided up front
+    (without it, the agent sometimes replied in Spanish to an English inquiry).
     """
     customer_language: str = Field(
         description="Language of the customer's latest message, e.g. English, Japanese.")
@@ -51,7 +51,7 @@ handoff_summary (to the human agent, in English, 2-4 short lines):
 
 
 def _format_conversation(state: SupportState) -> str:
-    """会話を、LLM に渡す文字列にする。ツールの呼び出しだけの AI メッセージは飛ばす。"""
+    """Format the conversation as a string for the LLM. AI messages with only tool calls are skipped."""
     lines = []
     for m in state["messages"]:
         if isinstance(m, HumanMessage):
@@ -64,11 +64,11 @@ def _format_conversation(state: SupportState) -> str:
 
 
 def _guidance_in_this_turn(state: SupportState) -> str:
-    """このターンで、先に AI が出した案内（最新のお客さんの発言より後の AI の本文）を返す。
+    """Return guidance the AI already gave this turn (AI text after the latest customer message).
 
-    例: 二重請求 → Knowledge が「Billing History で確認できます」と案内 → ここに来る。
-    chat_interface は最後のメッセージしか表示しないので、escalation_node で
-    この案内を引き継ぎのメッセージの前につなぐ。案内がなければ空文字。
+    Example: double charge -> Knowledge says "You can check it in Billing History" -> comes here.
+    chat_interface shows only the last message, so escalation_node
+    prepends this guidance to the handoff message. Empty string if there is no guidance.
     """
     messages = state["messages"]
     last_human = max(
@@ -80,8 +80,8 @@ def _guidance_in_this_turn(state: SupportState) -> str:
 
 
 def escalation_node(state: SupportState) -> dict:
-    """引き継ぎのメッセージと要約を作り、State に書き込む項目だけを返す。"""
-    # Classifier が直接ここに回した場合は escalation_reason がないので、分類の理由を使う
+    """Create the handoff message and summary, and return only the fields to write to the State."""
+    # If the Classifier routed here directly there is no escalation_reason, so use the classification reason
     reason = (state.get("escalation_reason")
               or state.get("classification_reason")
               or "Not specified")
@@ -102,7 +102,7 @@ def escalation_node(state: SupportState) -> dict:
         HumanMessage(content=user_prompt),
     ])
 
-    # お客さんに見えるのは最後のメッセージだけなので、このターンの案内を前につなぐ（コードで確実に）
+    # The customer sees only the last message, so prepend this turn's guidance (done in code to be reliable)
     content = f"{guidance}\n\n{result.customer_message}" if guidance else result.customer_message
 
     return {

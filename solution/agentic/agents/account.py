@@ -1,16 +1,16 @@
-"""Account Agent。設計書の 3.3 節。
+"""Account Agent. Design doc, Section 3.3.
 
-ツールで CultPass DB を照会・操作し、ユーザー個別の依頼を処理する。
-グラフ上では account_node ⇄ account_tools_node のループになる（ループは workflow.py で組む）。
+Uses tools to query and update the CultPass DB and handle user-specific requests.
+In the graph this is an account_node <-> account_tools_node loop (the loop is built in workflow.py).
 
   account_node
-    ① get_user_profile(user_id) をコードで直接呼ぶ（LLM に任せない）
-       いない／ブロック済み → escalation_reason を入れて終わり（LLM は呼ばない）
-    ② LLM（bind_tools）→ tool_calls があれば account_tools_node へ
-       tool_calls がなければ最終回答（resolution = "resolved"）
+    (1) Call get_user_profile(user_id) directly in code (not left to the LLM)
+        Not found / blocked -> set escalation_reason and stop (the LLM is not called)
+    (2) LLM (bind_tools) -> if there are tool_calls, go to account_tools_node
+        If there are no tool_calls, it is the final answer (resolution = "resolved")
   account_tools_node
-    ③ ツールを実行して ToolMessage を返す。user_id は必ず State の値に差し替える
-       ok=False のツールがあれば escalation_reason を入れる
+    (3) Run the tools and return ToolMessages. user_id is always replaced with the State value
+        If any tool returns ok=False, set escalation_reason
 """
 import json
 from datetime import date
@@ -26,7 +26,7 @@ from agentic.tools.cultpass_tools import (
     get_user_profile,
 )
 
-# LLM に渡すツール。get_user_profile は①でコードが呼ぶので渡さない
+# Tools given to the LLM. get_user_profile is not included because the code calls it in step (1)
 ACCOUNT_TOOLS = [get_subscription_tool,
                  get_reservations_tool, cancel_reservation_tool]
 TOOLS_BY_NAME = {t.name: t for t in ACCOUNT_TOOLS}
@@ -45,17 +45,17 @@ Today is {today}. The customer's user_id is "{user_id}". Never ask the customer 
 
 
 def account_node(state: SupportState) -> dict:
-    """ユーザーを確認してから LLM を呼び、State に書き込む項目だけを返す。"""
+    """Check the user, then call the LLM, and return only the fields to write to the State."""
     user_id = state.get("user_id", "")
 
-    # ① ユーザーの確認（コードで必ず行う）
+    # (1) Check the user (always done in code)
     profile = get_user_profile(user_id)
     if not profile["ok"]:
         return {"escalation_reason": profile["error"]}
     if profile["data"]["is_blocked"]:
         return {"escalation_reason": "User account is blocked"}
 
-    # ② LLM にツールを渡して呼ぶ
+    # (2) Call the LLM with the tools
     llm = get_llm().bind_tools(ACCOUNT_TOOLS)
     system = SystemMessage(content=SYSTEM_PROMPT.format(
         today=date.today(), user_id=user_id))
@@ -63,15 +63,15 @@ def account_node(state: SupportState) -> dict:
     response.name = "account_agent"
 
     if response.tool_calls:
-        # ツールを呼ぶ → account_tools_node へ（まだ終わらない）
+        # Tool call -> go to account_tools_node (not finished yet)
         return {"messages": [response], "escalation_reason": None}
 
-    # tool_calls がない = 最終回答
+    # No tool_calls = final answer
     return {"messages": [response], "escalation_reason": None, "resolution": "resolved"}
 
 
 def account_tools_node(state: SupportState) -> dict:
-    """直前の AIMessage の tool_calls を実行し、ToolMessage を返す。"""
+    """Run the tool_calls in the last AIMessage and return ToolMessages."""
     last_message: AIMessage = state["messages"][-1]
     tool_messages = []
     escalation_reason = None
@@ -81,8 +81,8 @@ def account_tools_node(state: SupportState) -> dict:
         if tool is None:
             result = {"ok": False, "error": f"Unknown tool: {call['name']}"}
         else:
-            # LLM が他人の user_id を指定しても、State のユーザーしか操作できないようにする
-            # user_id を State の値で上書きすることで、LLM が他人の ID を指定しても無視される。
+            # Only the State's user can be operated on, even if the LLM specifies another user_id
+            # Overwriting user_id with the State value means any other ID from the LLM is ignored.
             args = {**call["args"], "user_id": state.get("user_id", "")}
             result = tool.invoke(args)
 

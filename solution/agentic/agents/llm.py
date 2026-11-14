@@ -1,20 +1,20 @@
-"""4 つのエージェントが共通で使う LLM。
+"""LLM shared by the four agents.
 
-前提: 環境変数 VOCAREUM_API_KEY が設定されていること（呼び出す側で load_dotenv() しておく）
+Prerequisite: the VOCAREUM_API_KEY environment variable is set (the caller runs load_dotenv())
 """
 import os
 
 from langchain_openai import ChatOpenAI
 
 LLM_MODEL = "gpt-5.4-mini"
-# Udacity（Vocareum）経由で OpenAI を使う
+# Use OpenAI via Udacity (Vocareum)
 OPENAI_BASE_URL = "https://openai.vocareum.com/v1"
 
 
 def get_llm() -> ChatOpenAI:
-    """エージェント用の ChatOpenAI を作る。
+    """Create a ChatOpenAI instance for the agents.
 
-    temperature は指定しない（gpt-5 系は既定値以外を受け付けないことがあるため）。
+    temperature is not set (gpt-5 models may reject values other than the default).
     """
     return ChatOpenAI(
         model=LLM_MODEL,

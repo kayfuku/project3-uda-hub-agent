@@ -1,22 +1,22 @@
-"""グラフ全体で共有する状態（State）。設計書（agentic/design/architecture.md）の第4章。
+"""State shared across the whole graph. Design doc (agentic/design/architecture.md), Chapter 4.
 
-エージェント（agentic/agents/）と workflow.py の両方が import する。
-workflow.py に置くと循環 import になるので、別ファイルにしている。
+Imported by both the agents (agentic/agents/) and workflow.py.
+It lives in its own file because putting it in workflow.py would cause a circular import.
 """
 from langgraph.graph import MessagesState
 
 
 class SupportState(MessagesState):
-    # messages: Annotated[list[AnyMessage], add_messages]  ← MessagesState から継承（会話 = 短期メモリ）
+    # messages: Annotated[list[AnyMessage], add_messages]  <- inherited from MessagesState (conversation = short-term memory)
     ticket_id: str                    # = thread_id
-    user_id: str                      # CultPass 側のユーザー ID
-    ticket_metadata: dict             # channel, main_issue_type, tags など
-    past_context: str                 # 過去のやり取りの要約（長期メモリ）
-    category: str                     # Classifier の分類結果（knowledge / account / escalation）
+    user_id: str                      # User ID on the CultPass side
+    ticket_metadata: dict             # channel, main_issue_type, tags, etc.
+    past_context: str                 # Summary of past interactions (long-term memory)
+    category: str                     # Classifier result (knowledge / account / escalation)
     urgency: str                      # low / medium / high
-    classification_reason: str        # Classifier の判断理由
-    retrieved_articles: list[dict]    # 検索した記事とスコア
-    confidence: float                 # Knowledge の信頼度
-    escalation_reason: str | None     # エスカレーションの理由
-    handoff_summary: str              # 担当者向けの引き継ぎの要約（Escalation が書く）
+    classification_reason: str        # Classifier's reasoning
+    retrieved_articles: list[dict]    # Retrieved articles and their scores
+    confidence: float                 # Knowledge agent's confidence
+    escalation_reason: str | None     # Reason for escalation
+    handoff_summary: str              # Handoff summary for the human agent (written by Escalation)
     resolution: str                   # resolved / escalated

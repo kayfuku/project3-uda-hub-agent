@@ -1,13 +1,13 @@
-"""ナレッジ検索（agentic/tools/knowledge_search.py）のテスト。
+"""Tests for knowledge search (agentic/tools/knowledge_search.py).
 
-2種類に分ける。
-- A. API を使わないテスト : 入力チェック、エラー処理、ラッパー、記事の読み込み
-- B. API を使うテスト    : 実際に埋め込みを作り、信頼度としきい値が正しく働くか
-                          （VOCAREUM_API_KEY がないときは自動でスキップ）
+Split into two groups:
+- A. Tests without the API : input checks, error handling, wrapper, article loading
+- B. Tests with the API    : create real embeddings and check confidence and threshold
+                          (skipped automatically if VOCAREUM_API_KEY is not set)
 
-B の質問は、設計書 5.2 節の実測でしきい値（0.30）から離れていたものを選んだ。
+The questions in B were chosen from the design doc Section 5.2 measurements as ones far from the threshold (0.30).
 
-実行方法（solution/ で）:
+How to run (from solution/):
     ../venv/bin/python -m pytest -v
 """
 import os
@@ -26,7 +26,7 @@ needs_api = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------
-# A. API を使わないテスト
+# A. Tests without the API
 # ---------------------------------------------------------------
 @pytest.mark.parametrize("query", ["", "   "])
 def test_empty_query_returns_error(query):
@@ -35,7 +35,7 @@ def test_empty_query_returns_error(query):
 
 
 def test_search_failure_returns_error(monkeypatch):
-    """検索中に例外が起きても、例外を投げずに ok=False を返す。"""
+    """If an exception occurs during search, return ok=False instead of raising."""
     def broken_store():
         raise RuntimeError("connection failed")
 
@@ -50,12 +50,12 @@ def test_load_articles_reads_all_articles():
     docs = ks.load_articles()
 
     assert len(docs) == 14
-    # 埋め込む文字列には、タイトルが入っている
+    # The embedded text includes the title
     assert all(d.metadata["title"] in d.page_content for d in docs)
 
 
 def test_tool_wrapper_schema():
-    """LLM に見える名前と引数が正しい（k は見せない）。"""
+    """The name and arguments seen by the LLM are correct (k is hidden)."""
     assert ks.search_knowledge_tool.name == "search_knowledge"
     assert list(ks.search_knowledge_tool.args) == ["query"]
 
@@ -66,7 +66,7 @@ def test_tool_wrapper_calls_main_function():
 
 
 # ---------------------------------------------------------------
-# B. API を使うテスト
+# B. Tests with the API
 # ---------------------------------------------------------------
 @needs_api
 def test_relevant_question_is_confident():

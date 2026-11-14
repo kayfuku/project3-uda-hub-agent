@@ -1,19 +1,19 @@
-"""長期メモリ（udahub.db）の読み書き。設計書（agentic/design/architecture.md）の第7章。
+"""Read and write long-term memory (udahub.db). Design doc (agentic/design/architecture.md), Chapter 7.
 
-短期メモリ（同じチケット内の会話）は LangGraph の MemorySaver が持つ。
-ここでは、チケットをまたいで残す「長期メモリ」を扱う。
+Short-term memory (the conversation within one ticket) is held by LangGraph's MemorySaver.
+This module handles "long-term memory" that persists across tickets.
 
-  CultPass の user_id
-     │  udahub.users.external_user_id で対応づける
+  CultPass user_id
+     │  mapped via udahub.users.external_user_id
      ▼
-  udahub.users ──< tickets ──┬── ticket_metadata（status, main_issue_type, tags）
-                             └──< ticket_messages（role, content）
+  udahub.users ──< tickets ──┬── ticket_metadata (status, main_issue_type, tags)
+                             └──< ticket_messages (role, content)
 
-LLM がツールとして呼ぶのではなく、グラフのノード（load_memory / save_memory）が呼ぶ。
-そのため @tool ラッパーは作らない。
-返り値の形は cultpass_tools.py と同じ {"ok": ..., "data"/"error": ...}。
+These are called by graph nodes (load_memory / save_memory), not by the LLM as tools.
+So there are no @tool wrappers.
+Return values have the same shape as cultpass_tools.py: {"ok": ..., "data"/"error": ...}.
 
-前提: solution/ フォルダが sys.path に入っていること
+Prerequisite: the solution/ folder is on sys.path
 """
 import uuid
 from datetime import datetime, timedelta
@@ -30,10 +30,10 @@ from data.models import udahub
 SOLUTION_DIR = Path(__file__).resolve().parents[2]
 UDAHUB_DB_PATH = SOLUTION_DIR / "data" / "core" / "udahub.db"
 
-ACCOUNT_ID = "cultpass"                       # 最初の導入顧客
+ACCOUNT_ID = "cultpass"                       # first customer
 VALID_STATUSES = {"open", "resolved", "escalated"}
-PAST_TICKET_LIMIT = 3                         # 過去のチケットは新しい順に最大3件
-SNIPPET_LENGTH = 150                          # 要約に入れる発言の最大文字数
+PAST_TICKET_LIMIT = 3                         # up to 3 past tickets, newest first
+SNIPPET_LENGTH = 150                          # max characters per message in the summary
 
 _engine = create_engine(f"sqlite:///{UDAHUB_DB_PATH}")
 Session = sessionmaker(bind=_engine)
@@ -48,7 +48,7 @@ def _error(message: str) -> dict:
 
 
 def _db_missing() -> bool:
-    # SQLite はファイルがないと空の DB を勝手に作ってしまうので、先に確認する
+    # SQLite silently creates an empty DB if the file is missing, so check first
     return not UDAHUB_DB_PATH.exists()
 
 
@@ -58,14 +58,14 @@ def _short(text: str | None) -> str:
 
 
 # ---------------------------------------------------------------
-# チケットの作成（03 ノートブックで、新しい問い合わせが来たときに使う）
+# Ticket creation (used in notebook 03 when a new inquiry arrives)
 # ---------------------------------------------------------------
 def create_ticket(external_user_id: str, channel: str = "chat") -> dict:
-    """チケットと ticket_metadata（status=open）を作り、ticket_id を返す。
+    """Create a ticket and its ticket_metadata (status=open), and return the ticket_id.
 
-    udahub.db にまだいないユーザーなら、ユーザーも作る。
-    （user_name には ID を入れる。名前などの個人情報は増やさない）
-    最初のメッセージはここでは保存しない。save_messages にまとめて保存させる。
+    If the user is not in udahub.db yet, create the user as well.
+    (user_name is set to the ID, so no extra personal data such as names is stored.)
+    The first message is not saved here; save_messages saves all messages together.
     """
     if not external_user_id:
         return _error("external_user_id is required")
@@ -104,15 +104,15 @@ def create_ticket(external_user_id: str, channel: str = "chat") -> dict:
 
 
 # ---------------------------------------------------------------
-# 読み込み（load_memory ノード）
+# Loading (load_memory node)
 # ---------------------------------------------------------------
 def get_ticket_info(ticket_id: str) -> dict:
-    """チケットの持ち主（CultPass の user_id）と metadata を返す。
+    """Return the ticket owner (CultPass user_id) and its metadata.
 
-    load_memory が thread_id（= ticket_id）から user_id を知るために使う。
-    （chat_interface は messages しか渡さないため）
+    Used by load_memory to get the user_id from the thread_id (= ticket_id).
+    (because chat_interface only passes messages)
 
-    data の中身:
+    Contents of data:
         ticket_id, external_user_id, channel, created_at, status, main_issue_type, tags
     """
     if not ticket_id:
@@ -141,13 +141,13 @@ def get_ticket_info(ticket_id: str) -> dict:
 
 def load_past_context(external_user_id: str, current_ticket_id: str | None = None,
                       limit: int = PAST_TICKET_LIMIT) -> dict:
-    """同じユーザーの過去のチケットを新しい順に取り出し、短い文章にまとめる。
+    """Fetch the same user's past tickets, newest first, and summarize them as short text.
 
-    data の中身:
+    Contents of data:
         tickets : [{ticket_id, created_at, status, main_issue_type, tags,
                     first_user_message, last_ai_message}, ...]
-        summary : LLM に渡す文章（= state の past_context）
-    初めてのユーザーはエラーではない（tickets が空になる）。
+        summary : text passed to the LLM (= past_context in the state)
+    A first-time user is not an error (tickets is just empty).
     """
     if not external_user_id:
         return _error("external_user_id is required")
@@ -188,7 +188,7 @@ def load_past_context(external_user_id: str, current_ticket_id: str | None = Non
 
 
 def _format_summary(tickets: list[dict]) -> str:
-    """例: - 2026-11-10 [resolved] technical (qr_code): "The QR code..." → "Please..." """
+    """Example: - 2026-11-10 [resolved] technical (qr_code): "The QR code..." → "Please..." """
     if not tickets:
         return "No past tickets from this customer."
 
@@ -207,14 +207,14 @@ def _format_summary(tickets: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------
-# 保存（save_memory ノード）
+# Saving (save_memory node)
 # ---------------------------------------------------------------
 def save_messages(ticket_id: str, messages: list[BaseMessage]) -> dict:
-    """LangChain のメッセージを ticket_messages に保存する。
+    """Save LangChain messages to ticket_messages.
 
-    - 保存するのは「ユーザーの発言」と「本文のある AI の発言」だけ。
-      ツールの呼び出しや結果は、短期メモリ（MemorySaver）で確認できるので入れない。
-    - message.id がすでに保存されていれば飛ばす（同じチケットで会話が続いても二重に保存しない）。
+    - Only "user messages" and "AI messages with text content" are saved.
+      Tool calls and results are skipped because they can be checked in short-term memory (MemorySaver).
+    - Skip messages whose message.id is already saved (no duplicates when a conversation continues in the same ticket).
     """
     if not ticket_id:
         return _error("ticket_id is required")
@@ -231,7 +231,7 @@ def save_messages(ticket_id: str, messages: list[BaseMessage]) -> dict:
                 .filter_by(ticket_id=ticket_id)
             }
 
-            # 同じ秒に保存しても順番がわかるように、時刻を1マイクロ秒ずつずらす
+            # Shift each timestamp by 1 microsecond so the order is kept even within the same second
             now = datetime.now()
             count = 0
             for msg in messages:
@@ -240,7 +240,7 @@ def save_messages(ticket_id: str, messages: list[BaseMessage]) -> dict:
                 elif isinstance(msg, AIMessage) and msg.text.strip():
                     role = udahub.RoleEnum.ai
                 else:
-                    continue  # ツールの呼び出しだけの AI メッセージ、ToolMessage、SystemMessage
+                    continue  # AI messages with only tool calls, ToolMessage, SystemMessage
 
                 message_id = msg.id or str(uuid.uuid4())
                 if message_id in saved_ids:
@@ -263,10 +263,10 @@ def save_messages(ticket_id: str, messages: list[BaseMessage]) -> dict:
 
 
 def save_handoff_summary(ticket_id: str, summary: str) -> dict:
-    """担当者向けの引き継ぎの要約を、ticket_messages に role=system で保存する。
+    """Save the handoff summary for the human agent to ticket_messages with role=system.
 
-    お客さんとの会話（user / ai）とは役割を分けておく。
-    load_past_context は user と ai の発言しか読まないので、要約が past_context に混ざることはない。
+    This keeps it separate from the customer conversation (user / ai).
+    load_past_context only reads user and ai messages, so the summary never leaks into past_context.
     """
     if not ticket_id:
         return _error("ticket_id is required")
@@ -296,9 +296,9 @@ def save_handoff_summary(ticket_id: str, summary: str) -> dict:
 def update_ticket_status(ticket_id: str, status: str,
                          main_issue_type: str | None = None,
                          tags: str | None = None) -> dict:
-    """チケットの結果（resolved / escalated）と分類を ticket_metadata に保存する。
+    """Save the ticket result (resolved / escalated) and classification to ticket_metadata.
 
-    main_issue_type と tags は、渡されたときだけ上書きする。
+    main_issue_type and tags are overwritten only when given.
     """
     if not ticket_id:
         return _error("ticket_id is required")

@@ -1,9 +1,9 @@
-"""CultPass DB ツール（agentic/tools/cultpass_tools.py）のテスト。
+"""Tests for the CultPass DB tools (agentic/tools/cultpass_tools.py).
 
-本物の cultpass.db は書き換えない。
-各テストの前に DB を一時フォルダにコピーし、ツールがそのコピーを使うように差し替える。
+The real cultpass.db is never modified.
+Before each test, the DB is copied to a temp folder and the tools are patched to use the copy.
 
-実行方法（solution/ で）:
+How to run (from solution/):
     ../venv/bin/python -m pytest -v
 """
 import shutil
@@ -18,11 +18,11 @@ from data.models import cultpass
 
 
 # ---------------------------------------------------------------
-# フィクスチャ（テストの準備）
+# Fixtures (test setup)
 # ---------------------------------------------------------------
 @pytest.fixture
 def db(tmp_path, monkeypatch):
-    """DB のコピーを作り、ツールがそのコピーを使うようにする。"""
+    """Copy the DB and make the tools use the copy."""
     test_db = tmp_path / "cultpass.db"
     shutil.copy(ct.CULTPASS_DB_PATH, test_db)
 
@@ -34,7 +34,7 @@ def db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def users(db):
-    """ブロックされていないユーザー2人と、ブロック済みユーザー1人の ID。"""
+    """IDs of two non-blocked users and one blocked user."""
     with db() as s:
         normal = [u for (u,) in s.query(cultpass.User.user_id).filter_by(is_blocked=False)]
         blocked = s.query(cultpass.User.user_id).filter_by(is_blocked=True).first()[0]
@@ -43,7 +43,7 @@ def users(db):
 
 @pytest.fixture
 def make_reservation(db):
-    """テスト用の予約を作る関数を返す。体験の開始時刻は now + hours にする。"""
+    """Return a function that creates a test reservation. The experience starts at now + hours."""
     def _make(user_id, hours_from_now=48, status="reserved"):
         with db() as s:
             exp = s.query(cultpass.Experience).first()
@@ -82,7 +82,7 @@ def test_get_user_profile_empty_id(db):
 
 
 def test_db_missing(tmp_path, monkeypatch):
-    # DB ファイルがないときに、空の DB を作らずエラーを返すこと
+    # If the DB file is missing, return an error without creating an empty DB
     missing = tmp_path / "missing.db"
     monkeypatch.setattr(ct, "CULTPASS_DB_PATH", missing)
     result = ct.get_user_profile("anyone")
@@ -110,7 +110,7 @@ def test_get_subscription_user_not_found(db):
 # get_reservations
 # ---------------------------------------------------------------
 def test_get_reservations_empty_list(users):
-    # 予約がないユーザーは、エラーではなく空リスト
+    # A user with no reservations gets an empty list, not an error
     assert ct.get_reservations(users["normal"]) == {"ok": True, "data": []}
 
 
@@ -139,7 +139,7 @@ def test_cancel_success_more_than_24h(db, users, make_reservation):
     assert result["ok"] is True
     assert result["data"]["status"] == "cancelled"
     assert result["data"]["within_24h"] is False
-    # DB にも反映されていること（ステータスと空き枠）
+    # The change is reflected in the DB (status and slots)
     with db() as s:
         r = s.get(cultpass.Reservation, rid)
         assert r.status == "cancelled"
@@ -164,7 +164,7 @@ def test_cancel_other_users_reservation(db, users, make_reservation):
     rid = make_reservation(users["normal"])
     result = ct.cancel_reservation(users["other"], rid)
     assert result == {"ok": False, "error": "Reservation does not belong to this user"}
-    # 予約は変わっていないこと
+    # The reservation is unchanged
     with db() as s:
         assert s.get(cultpass.Reservation, rid).status == "reserved"
 
@@ -192,7 +192,7 @@ def test_cancel_missing_arguments(db):
 
 
 # ---------------------------------------------------------------
-# @tool ラッパー
+# @tool wrappers
 # ---------------------------------------------------------------
 def test_tools_are_registered():
     names = [t.name for t in ct.CULTPASS_TOOLS]
@@ -201,7 +201,7 @@ def test_tools_are_registered():
 
 
 def test_tool_invoke_returns_same_as_core(users):
-    # ラッパーは本体を呼ぶだけなので、結果は同じになる
+    # The wrapper just calls the core function, so the result is the same
     tools = {t.name: t for t in ct.CULTPASS_TOOLS}
     assert tools["get_subscription"].invoke({"user_id": users["normal"]}) \
         == ct.get_subscription(users["normal"])

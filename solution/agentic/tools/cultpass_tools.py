@@ -1,11 +1,11 @@
-"""CultPass DB を操作するツール。
+"""Tools that operate on the CultPass DB.
 
-設計書（agentic/design/architecture.md の 6.1 節）に沿って、2層に分ける。
-- 本体    : 普通の Python 関数。結果は {"ok": ..., "data"/"error": ...} の dict で返す。
-- ラッパー : LangChain の @tool で本体を包む（後で追加する。MCP に移るときはここを差し替える）。
+Following the design doc (agentic/design/architecture.md, Section 6.1), there are two layers:
+- Core    : plain Python functions. They return a dict {"ok": ..., "data"/"error": ...}.
+- Wrapper : LangChain @tool around the core functions (swap this part when moving to MCP).
 
-前提: solution/ フォルダが sys.path に入っていること
-（solution/ でノートブックを開けば、ほかのノートブックと同じく `data.models` を import できる）。
+Prerequisite: the solution/ folder is on sys.path
+(if the notebook is opened in solution/, `data.models` can be imported just like in the other notebooks).
 """
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,7 +17,7 @@ from sqlalchemy.orm import sessionmaker
 
 from data.models import cultpass
 
-# このファイルの場所を基準に DB のパスを決める（実行場所に左右されない）
+# Resolve the DB path relative to this file (independent of the working directory)
 # solution/agentic/tools/cultpass_tools.py → parents[2] = solution/
 SOLUTION_DIR = Path(__file__).resolve().parents[2]
 CULTPASS_DB_PATH = SOLUTION_DIR / "data" / "external" / "cultpass.db"
@@ -27,7 +27,7 @@ Session = sessionmaker(bind=_engine)
 
 
 # ---------------------------------------------------------------
-# 返り値の形をそろえるための小さなヘルパー
+# Small helpers to keep the return shape consistent
 # ---------------------------------------------------------------
 def _ok(data) -> dict:
     return {"ok": True, "data": data}
@@ -38,15 +38,15 @@ def _error(message: str) -> dict:
 
 
 def _db_missing() -> bool:
-    # SQLite はファイルがないと空の DB を勝手に作ってしまうので、先に確認する
+    # SQLite silently creates an empty DB if the file is missing, so check first
     return not CULTPASS_DB_PATH.exists()
 
 
 # ---------------------------------------------------------------
-# 本体（DB 操作）
+# Core functions (DB operations)
 # ---------------------------------------------------------------
 def get_user_profile(user_id: str) -> dict:
-    """ユーザーが存在するか、ブロックされていないかを返す。"""
+    """Return whether the user exists and is not blocked."""
     if not user_id:
         return _error("user_id is required")
     if _db_missing():
@@ -66,7 +66,7 @@ def get_user_profile(user_id: str) -> dict:
 
 
 def get_subscription(user_id: str) -> dict:
-    """ユーザーのサブスクリプション（状態・プラン・月の利用枠）を返す。"""
+    """Return the user's subscription (status, plan, monthly quota)."""
     if not user_id:
         return _error("user_id is required")
     if _db_missing():
@@ -82,9 +82,9 @@ def get_subscription(user_id: str) -> dict:
                 return _error(f"No subscription found for user: {user_id}")
             return _ok({
                 "subscription_id": sub.subscription_id,
-                "status": sub.status,                # active / cancelled など
+                "status": sub.status,                # active / cancelled, etc.
                 "tier": sub.tier,                    # basic / premium
-                "monthly_quota": sub.monthly_quota,  # 月に使える体験の数
+                "monthly_quota": sub.monthly_quota,  # number of experiences allowed per month
                 "started_at": sub.started_at.isoformat() if sub.started_at else None,
                 "ended_at": sub.ended_at.isoformat() if sub.ended_at else None,
             })
@@ -93,7 +93,7 @@ def get_subscription(user_id: str) -> dict:
 
 
 def get_reservations(user_id: str) -> dict:
-    """ユーザーの予約一覧を返す。予約が0件でも成功（空リスト）として返す。"""
+    """Return the user's reservations. Zero reservations is still a success (empty list)."""
     if not user_id:
         return _error("user_id is required")
     if _db_missing():
@@ -121,11 +121,11 @@ def get_reservations(user_id: str) -> dict:
 
 
 def cancel_reservation(user_id: str, reservation_id: str) -> dict:
-    """予約をキャンセルする（status を 'cancelled' にし、体験の空き枠を1つ戻す）。
+    """Cancel a reservation (set status to 'cancelled' and give one slot back to the experience).
 
-    ナレッジ記事「How to Cancel or Change a Reservation」のルールに合わせて、
-    開始まで24時間を切っていてもキャンセルはできる。その場合は within_24h=True を返し、
-    クレジットが消費されることをエージェントがユーザーに伝えられるようにする。
+    Following the rules in the knowledge article "How to Cancel or Change a Reservation",
+    cancellation is allowed even within 24 hours of the start. In that case within_24h=True is returned
+    so the agent can tell the user that the credit will be used.
     """
     if not user_id or not reservation_id:
         return _error("user_id and reservation_id are required")
@@ -143,7 +143,7 @@ def cancel_reservation(user_id: str, reservation_id: str) -> dict:
             reservation = session.get(cultpass.Reservation, reservation_id)
             if reservation is None:
                 return _error(f"Reservation not found: {reservation_id}")
-            # 他人の予約はキャンセルさせない
+            # Do not allow cancelling someone else's reservation
             if reservation.user_id != user_id:
                 return _error("Reservation does not belong to this user")
             if reservation.status == "cancelled":
@@ -169,10 +169,10 @@ def cancel_reservation(user_id: str, reservation_id: str) -> dict:
 
 
 # ---------------------------------------------------------------
-# ラッパー（LangChain の @tool）
-# - LLM に見える名前は @tool("...") で指定する（本体と同じ名前にそろえる）
-# - docstring がそのまま LLM 向けのツール説明になるので、英語で書く
-# - MCP に移るときは、この部分だけを @mcp.tool に差し替える
+# Wrappers (LangChain @tool)
+# - The name the LLM sees is set with @tool("...") (same as the core function name)
+# - The docstring becomes the tool description for the LLM, so it is written in English
+# - When moving to MCP, replace only this part with @mcp.tool
 # ---------------------------------------------------------------
 @tool("get_user_profile", parse_docstring=True)
 def get_user_profile_tool(user_id: str) -> dict:
@@ -220,7 +220,7 @@ def cancel_reservation_tool(user_id: str, reservation_id: str) -> dict:
     return cancel_reservation(user_id, reservation_id)
 
 
-# エージェントに渡すツールの一覧
+# List of tools given to the agent
 CULTPASS_TOOLS = [
     get_user_profile_tool,
     get_subscription_tool,

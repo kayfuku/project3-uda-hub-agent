@@ -1,10 +1,10 @@
-"""Classifier Agent（スーパーバイザー）。設計書の 3.1 節。
+"""Classifier Agent (supervisor). Design doc, Section 3.1.
 
-チケットの内容とメタデータから、行き先（category）と緊急度（urgency）を決める。
-LLM の構造化出力（Pydantic モデル）を使うので、返り値の形が毎回そろう。
+Decides the route (category) and urgency from the ticket content and metadata.
+Uses LLM structured output (a Pydantic model), so the output shape is always the same.
 
-  入力: 最新のユーザーメッセージ、直前の会話（最大 6 件）、ticket_metadata、past_context
-  出力: {"category": ..., "urgency": ..., "classification_reason": ...}
+  Input:  latest user message, recent conversation (up to 6 messages), ticket_metadata, past_context
+  Output: {"category": ..., "urgency": ..., "classification_reason": ...}
 """
 from typing import Literal
 
@@ -14,12 +14,12 @@ from pydantic import BaseModel, Field
 from agentic.agents.llm import get_llm
 from agentic.state import SupportState
 
-# 直前の会話を何件まで渡すか（「Yes, please cancel it」のような短い返事を分類するため）
+# How many recent messages to pass (to classify short replies like "Yes, please cancel it")
 RECENT_MESSAGE_LIMIT = 6
 
 
 class Classification(BaseModel):
-    """Classifier の出力。LLM はこの形で答える。"""
+    """Classifier output. The LLM answers in this shape."""
     category: Literal["knowledge", "account", "escalation"] = Field(
         description="Which agent should handle the ticket."
     )
@@ -30,7 +30,7 @@ class Classification(BaseModel):
         description="One short sentence explaining the decision.")
 
 
-# 分類の基準は設計書 3.1 節の表と同じ
+# The classification rules match the table in design doc Section 3.1
 SYSTEM_PROMPT = """\
 You are the classifier of UDA-Hub, a customer support system for CultPass \
 (a subscription service for cultural experiences such as museums, concerts and workshops).
@@ -61,7 +61,7 @@ the assistant asked in the recent conversation, choose the category of that ques
 
 
 def _latest_user_message(state: SupportState) -> str:
-    """messages の中から、いちばん新しいユーザーの発言を取り出す。"""
+    """Get the latest user message from messages."""
     for message in reversed(state["messages"]):
         if isinstance(message, HumanMessage):
             return message.content
@@ -69,12 +69,12 @@ def _latest_user_message(state: SupportState) -> str:
 
 
 def _recent_conversation(state: SupportState) -> str:
-    """最新のユーザーの発言より前の会話を、最大 RECENT_MESSAGE_LIMIT 件の文字列にする。
+    """Turn the conversation before the latest user message into a string (up to RECENT_MESSAGE_LIMIT messages).
 
-    お客さんと AI の本文だけを使う（ツールの呼び出しや結果は入れない）。
+    Only customer and AI text is used (tool calls and results are left out).
     """
     messages = state["messages"]
-    # いちばん新しいユーザーの発言の位置を探し、それより前だけを使う
+    # Find the position of the latest user message and use only what comes before it
     last_human = max(
         (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=0
     )
@@ -88,7 +88,7 @@ def _recent_conversation(state: SupportState) -> str:
 
 
 def classifier_node(state: SupportState) -> dict:
-    """チケットを分類し、State に書き込む項目だけを返す。"""
+    """Classify the ticket and return only the fields to write to the State."""
     user_prompt = (
         f"Ticket metadata: {state.get('ticket_metadata', {})}\n"
         f"Past context: {state.get('past_context') or 'None'}\n\n"

@@ -1,16 +1,16 @@
-"""UDA-Hub のグラフ（StateGraph）。設計書の第2章。
+"""UDA-Hub graph (StateGraph). Design doc, Chapter 2.
 
   START → load_memory → classifier ─┬─ knowledge ──────────────┬─→ save_memory → END
                                     ├─ account ⇄ account_tools ─┤
-                                    └─ escalation ←─────────────┘（エスカレーションのとき）
+                                    └─ escalation ←─────────────┘ (on escalation)
 
-各エージェントは agentic/agents/ にある「State を受け取り、更新する項目を返す関数」。
-ここでは、それをノードとして並べ、条件付きエッジでつなぐだけにする。
+Each agent in agentic/agents/ is "a function that takes the State and returns the fields to update".
+This file only adds them as nodes and connects them with conditional edges.
 
-load_memory と save_memory は補助ノード（エージェントではない）。udahub.db の長期メモリを読み書きする。
+load_memory and save_memory are helper nodes (not agents). They read and write long-term memory in udahub.db.
 
-ログ（logs/workflow.jsonl）は、このファイルだけで書く。エージェントのコードには入れず、
-「エージェントを呼んでログを 1 行書く」小さな関数（classifier_step など）でノードを包む。
+Logs (logs/workflow.jsonl) are written only in this file. Logging is kept out of the agent code;
+instead, each node is wrapped in a small function (e.g. classifier_step) that "calls the agent and writes one log line".
 """
 import json
 
@@ -35,17 +35,17 @@ from agentic.tools.memory import (
 
 
 # ---------------------------------------------------------------
-# 補助ノード（エージェントではない）
+# Helper nodes (not agents)
 # ---------------------------------------------------------------
 def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
-    """ターンの入口。チケットの情報と長期メモリを読み、前のターンの結果をリセットする。
+    """Start of a turn. Load the ticket info and long-term memory, and reset the previous turn's results.
 
-    - chat_interface は messages しか渡さないので、thread_id（= ticket_id）から
-      udahub.db のチケットを引いて、user_id と ticket_metadata を知る。
-    - 同じユーザーの過去のチケットを past_context にする（長期メモリ）。
-    - MemorySaver は State を丸ごと残すので、リセットしないと
-      前のターンの escalation_reason などで、間違った行き先に進んでしまう。
-    DB の関数がエラーを返しても止めない（user_id が空なら、Account がエスカレーションする）。
+    - chat_interface only passes messages, so we look up the ticket in udahub.db
+      by thread_id (= ticket_id) to get user_id and ticket_metadata.
+    - Past tickets of the same user become past_context (long-term memory).
+    - MemorySaver keeps the whole State, so without a reset, leftovers such as
+      the previous turn's escalation_reason would send us to the wrong node.
+    Do not stop if a DB function returns an error (if user_id is empty, Account will escalate).
     """
     ticket_id = config["configurable"]["thread_id"]
 
@@ -69,7 +69,7 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
         "user_id": user_id,
         "ticket_metadata": ticket_metadata,
         "past_context": past_context,
-        # 以下は前のターンの結果のリセット
+        # Reset the previous turn's results below
         "category": "",
         "urgency": "",
         "classification_reason": "",
@@ -82,17 +82,17 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
 
 
 def save_memory_node(state: SupportState) -> dict:
-    """ターンの出口。会話と結果を udahub.db に保存する（長期メモリ）。
+    """End of a turn. Save the conversation and results to udahub.db (long-term memory).
 
-    DB に書くのはこのノードだけ（エージェントは udahub.db に書かない）。
-    status はそのターンの結果で上書きする。ただし、一度 escalated になったチケットは
-    escalated のままにする（担当者の対応待ちが、次のターンの resolved で見えなくならないように）。
+    This is the only node that writes to the DB (agents never write to udahub.db).
+    status is overwritten with this turn's result. However, once a ticket is escalated it
+    stays escalated (so a pending human handoff is not hidden by a later 'resolved' turn).
     """
     ticket_id = state["ticket_id"]
 
-    results = []  # DB の関数の結果（エラーをログに残すため）
+    results = []  # Results of the DB functions (to log any errors)
 
-    # 同じ発言は message.id で飛ばすので、毎ターン全部渡してよい
+    # Already-saved messages are skipped by message.id, so it is fine to pass all of them every turn
     results.append(save_messages(ticket_id, state["messages"]))
 
     if state.get("resolution") == "escalated" and state.get("handoff_summary"):
@@ -118,7 +118,7 @@ def save_memory_node(state: SupportState) -> dict:
 
 
 # ---------------------------------------------------------------
-# エージェントのノード（エージェントを呼び、ログを 1 行書く）
+# Agent nodes (call the agent and write one log line)
 # ---------------------------------------------------------------
 def classifier_step(state: SupportState) -> dict:
     update = classifier_node(state)
@@ -150,7 +150,7 @@ def account_step(state: SupportState) -> dict:
 
 def account_tools_step(state: SupportState) -> dict:
     update = account_tools_node(state)
-    for message in update["messages"]:  # ツールごとに 1 行
+    for message in update["messages"]:  # one line per tool
         result = json.loads(message.content)
         log_event(state["ticket_id"], "account_tools", "tool_called",
                   tool=message.name, ok=result["ok"], error=result.get("error"))
@@ -165,7 +165,7 @@ def escalation_step(state: SupportState) -> dict:
 
 
 # ---------------------------------------------------------------
-# ルーティング（条件付きエッジ）。返す文字列 = 次のノードの名前
+# Routing (conditional edges). The returned string = name of the next node
 # ---------------------------------------------------------------
 def route_after_classifier(state: SupportState) -> str:
     return state["category"]  # "knowledge" / "account" / "escalation"
@@ -180,7 +180,7 @@ def route_after_account(state: SupportState) -> str:
         return "escalation"
     if state["messages"][-1].tool_calls:
         return "account_tools"
-    return "save_memory"  # 最終回答
+    return "save_memory"  # final answer
 
 
 def route_after_account_tools(state: SupportState) -> str:
@@ -188,7 +188,7 @@ def route_after_account_tools(state: SupportState) -> str:
 
 
 # ---------------------------------------------------------------
-# グラフの組み立て
+# Build the graph
 # ---------------------------------------------------------------
 def build_graph(checkpointer=None):
     graph = StateGraph(SupportState)
@@ -217,14 +217,14 @@ def build_graph(checkpointer=None):
     return graph.compile(checkpointer=checkpointer)
 
 
-# 03_agentic_app.ipynb はこれを import する。短期メモリ = MemorySaver（thread_id ごと）
+# 03_agentic_app.ipynb imports this. Short-term memory = MemorySaver (per thread_id)
 orchestrator = build_graph(checkpointer=MemorySaver())
 
 
 def new_ticket(user_id: str, channel: str = "chat") -> str:
-    """新しい問い合わせのチケットを udahub.db に作り、ticket_id（= thread_id）を返す。
+    """Create a ticket for a new inquiry in udahub.db and return its ticket_id (= thread_id).
 
-    03 ノートブックでの使い方:
+    Usage in notebook 03:
         ticket_id = new_ticket("f1f10d")
         chat_interface(orchestrator, ticket_id)
     """

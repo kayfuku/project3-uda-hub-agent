@@ -1,9 +1,9 @@
-"""構造化ログ（JSON Lines）。設計書の第9章。
+"""Structured logging (JSON Lines). Design doc, Chapter 9.
 
-1 行に 1 件の JSON を solution/logs/workflow.jsonl に追記する。
-ticket_id や event で検索・絞り込みができる。
+Appends one JSON object per line to solution/logs/workflow.jsonl.
+Entries can be searched and filtered by ticket_id or event.
 
-例:
+Example:
   {"ts": "2026-11-14T10:00:00", "ticket_id": "t-001", "node": "classifier",
    "event": "classified", "category": "knowledge", "urgency": "low"}
 """
@@ -20,19 +20,19 @@ _logger = logging.getLogger("udahub")
 
 
 def _get_logger() -> logging.Logger:
-    """最初に使うときに、ファイルへ書き出す設定をする（1 回だけ）。"""
+    """Set up the file handler on first use (only once)."""
     if not _logger.handlers:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(message)s"))  # JSON だけを書く
+        handler.setFormatter(logging.Formatter("%(message)s"))  # write only the JSON
         _logger.addHandler(handler)
         _logger.setLevel(logging.INFO)
-        _logger.propagate = False  # ノートブックの画面には出さない
+        _logger.propagate = False  # do not show in the notebook output
     return _logger
 
 
 def log_event(ticket_id: str, node: str, event: str, **fields) -> None:
-    """イベントを 1 行の JSON として記録する。"""
+    """Record an event as one line of JSON."""
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "ticket_id": ticket_id,
@@ -44,7 +44,7 @@ def log_event(ticket_id: str, node: str, event: str, **fields) -> None:
 
 
 def read_logs(ticket_id: str | None = None) -> list[dict]:
-    """ログを読み込む。ticket_id を渡すと、そのチケットの分だけ返す（ノートブックでの確認用）。"""
+    """Read the logs. If ticket_id is given, return only that ticket's entries (for checking in the notebook)."""
     if not LOG_PATH.exists():
         return []
     with open(LOG_PATH, encoding="utf-8") as f:
