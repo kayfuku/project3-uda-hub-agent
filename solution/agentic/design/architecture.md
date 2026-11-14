@@ -307,7 +307,7 @@ flowchart LR
 | 一般的な質問（記事なし） | Classifier → Knowledge → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 5（ギフトカード） |
 | 記事がエスカレーションを指示している（二重請求など） | Classifier → Knowledge → Escalation | 記事の案内と引き継ぎ。`escalated` | シナリオ 3 |
 | ユーザー個別の照会・操作 | Classifier → Account ⇄ Tools | ツールの結果に基づく回答。`resolved` | シナリオ 2 |
-| ユーザー不明・ブロック済み | Classifier → Account → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 4 |
+| ユーザー不明・ブロック済み | Classifier → Account → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 4（ブロック済み）、シナリオ 6（CultPass にいない） |
 | ツールのエラー | Classifier → Account ⇄ Tools → Escalation | 引き継ぎのメッセージ。`escalated` | — |
 | 明確に人を求める・苦情 | Classifier → Escalation | 引き継ぎのメッセージ。緊急度を記録して `escalated` | シナリオ 5（責任者と話したい） |
 
@@ -345,7 +345,7 @@ flowchart LR
 | ツールの単体テスト | 正常系、存在しないユーザー、ブロック済みのユーザー、他人の予約のキャンセル、キャンセル済みの予約、開始済みのイベント、24時間以内のキャンセル、引数の不足、DB ファイルがない、`@tool` ラッパーが本体と同じ結果を返す | `tests/test_cultpass_tools.py` |
 | ナレッジ検索 | 関係のある質問のスコアがしきい値以上で、関係のない質問はしきい値未満になる。スコアの高い順に並ぶ。空の質問や検索の失敗はエラーを返す | `tests/test_knowledge_search.py` |
 | 長期メモリ | チケットの作成、メッセージの保存（二重に保存しない）、status の更新、過去のチケットの取り出し（新しい順・件数の上限・ユーザーを混ぜない）、引き継ぎの要約が `past_context` に混ざらない | `tests/test_memory.py` |
-| ルーティング・エンドツーエンド | サンプルチケットごとに期待するエージェントへ振り分けられ、「解決」と「エスカレーション」の両方のシナリオが動く（第8章の表） | `03_agentic_app.ipynb` のシナリオ 1〜5 |
+| ルーティング・エンドツーエンド | サンプルチケットごとに期待するエージェントへ振り分けられ、「解決」と「エスカレーション」の両方のシナリオが動く（第8章の表） | `03_agentic_app.ipynb` のシナリオ 1〜6 |
 | 短期メモリ | 同じ `thread_id` で会話が続く（シナリオ 2 の2回目の質問）。`get_state_history` でツールの呼び出しも確認できる | `03_agentic_app.ipynb` |
 
 - `tests/` は pytest で実行する（`solution/` から `pytest`）。ナレッジ検索の一部のテストは、埋め込みの API を呼ぶ。
