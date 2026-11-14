@@ -129,7 +129,7 @@ LangGraph の `MessagesState` を継承するので、会話の履歴を持つ `
 from langgraph.graph import MessagesState
 
 class SupportState(MessagesState):
-    # messages: list[AnyMessage]  ← MessagesState から継承（会話＝短期メモリ）
+    # messages: Annotated[list[AnyMessage], add_messages]  ← MessagesState から継承（会話＝短期メモリ）
     ticket_id: str                    # = thread_id
     user_id: str                      # CultPass 側のユーザー ID
     ticket_metadata: dict             # channel, main_issue_type, tags など
