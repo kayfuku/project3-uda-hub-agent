@@ -3,16 +3,19 @@
 チケットの内容とメタデータから、行き先（category）と緊急度（urgency）を決める。
 LLM の構造化出力（Pydantic モデル）を使うので、返り値の形が毎回そろう。
 
-  入力: 最新のユーザーメッセージ、ticket_metadata、past_context
+  入力: 最新のユーザーメッセージ、直前の会話（最大 6 件）、ticket_metadata、past_context
   出力: {"category": ..., "urgency": ..., "classification_reason": ...}
 """
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from agentic.agents.llm import get_llm
 from agentic.state import SupportState
+
+# 直前の会話を何件まで渡すか（「Yes, please cancel it」のような短い返事を分類するため）
+RECENT_MESSAGE_LIMIT = 6
 
 
 class Classification(BaseModel):
@@ -49,6 +52,8 @@ urgency:
 - "low": general questions with no time pressure.
 
 Use the ticket metadata and the past context only as hints. The latest message is the most important.
+If the latest message is a short reply (for example "yes", "no", "the first one") to a question
+the assistant asked in the recent conversation, choose the category of that question.
 """
 
 
@@ -60,11 +65,31 @@ def _latest_user_message(state: SupportState) -> str:
     return ""
 
 
+def _recent_conversation(state: SupportState) -> str:
+    """最新のユーザーの発言より前の会話を、最大 RECENT_MESSAGE_LIMIT 件の文字列にする。
+
+    お客さんと AI の本文だけを使う（ツールの呼び出しや結果は入れない）。
+    """
+    messages = state["messages"]
+    # いちばん新しいユーザーの発言の位置を探し、それより前だけを使う
+    last_human = max(
+        (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=0
+    )
+    lines = []
+    for m in messages[:last_human]:
+        if isinstance(m, HumanMessage):
+            lines.append(f"Customer: {m.text}")
+        elif isinstance(m, AIMessage) and m.text.strip():
+            lines.append(f"Assistant: {m.text}")
+    return "\n".join(lines[-RECENT_MESSAGE_LIMIT:]) or "None"
+
+
 def classifier_node(state: SupportState) -> dict:
     """チケットを分類し、State に書き込む項目だけを返す。"""
     user_prompt = (
         f"Ticket metadata: {state.get('ticket_metadata', {})}\n"
         f"Past context: {state.get('past_context') or 'None'}\n\n"
+        f"Recent conversation:\n{_recent_conversation(state)}\n\n"
         f"Latest customer message:\n{_latest_user_message(state)}"
     )
 
