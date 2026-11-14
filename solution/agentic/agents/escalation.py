@@ -2,7 +2,8 @@
 
 人間の担当者に引き継ぐ。担当者がすぐ対応できるよう、要約を残す。
 
-  入力: 会話全体、escalation_reason（なければ classification_reason）、urgency
+  入力: 会話全体、escalation_reason（なければ classification_reason）、urgency、
+        このターンで先に出した案内（あれば、コードで customer_message の前につなぐ）
   出力: customer_message（お客さん向け。お客さんの言語）
         handoff_summary（担当者向け。英語）
   返す項目: {"messages": [...], "handoff_summary": ..., "resolution": "escalated"}
@@ -41,7 +42,8 @@ customer_message (to the customer):
 - Tell them a member of our support team will follow up.
 - Do not mention internal details such as confidence scores, tool names, error messages
   or that the account is "blocked". Say "our team needs to review your request" instead.
-- If an earlier assistant message already gave guidance, do not repeat it.
+- If "Guidance already given in this turn" is not None, do not repeat it
+  (it is shown to the customer together with your message).
 
 handoff_summary (to the human agent, in English, 2-4 short lines):
 - The customer's issue, the escalation reason, the urgency, and what has already been tried or answered.
@@ -61,6 +63,22 @@ def _format_conversation(state: SupportState) -> str:
     return "\n".join(lines)
 
 
+def _guidance_in_this_turn(state: SupportState) -> str:
+    """このターンで、先に AI が出した案内（最新のお客さんの発言より後の AI の本文）を返す。
+
+    例: 二重請求 → Knowledge が「Billing History で確認できます」と案内 → ここに来る。
+    chat_interface は最後のメッセージしか表示しないので、escalation_node で
+    この案内を引き継ぎのメッセージの前につなぐ。案内がなければ空文字。
+    """
+    messages = state["messages"]
+    last_human = max(
+        (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)), default=-1
+    )
+    texts = [m.text for m in messages[last_human + 1:]
+             if isinstance(m, AIMessage) and m.text.strip()]
+    return "\n".join(texts)
+
+
 def escalation_node(state: SupportState) -> dict:
     """引き継ぎのメッセージと要約を作り、State に書き込む項目だけを返す。"""
     # Classifier が直接ここに回した場合は escalation_reason がないので、分類の理由を使う
@@ -68,12 +86,14 @@ def escalation_node(state: SupportState) -> dict:
               or state.get("classification_reason")
               or "Not specified")
 
+    guidance = _guidance_in_this_turn(state)
     user_prompt = (
         f"Escalation reason: {reason}\n"
         f"Urgency: {state.get('urgency') or 'unknown'}\n"
         f"Customer user_id: {state.get('user_id') or 'unknown'}\n"
         f"Past context: {state.get('past_context') or 'None'}\n\n"
         f"Conversation:\n{_format_conversation(state)}\n\n"
+        f"Guidance already given in this turn:\n{guidance or 'None'}\n\n"
         f"Customer's latest message:\n{_latest_user_message(state)}"
     )
     llm = get_llm().with_structured_output(EscalationOutput)
@@ -82,8 +102,11 @@ def escalation_node(state: SupportState) -> dict:
         HumanMessage(content=user_prompt),
     ])
 
+    # お客さんに見えるのは最後のメッセージだけなので、このターンの案内を前につなぐ（コードで確実に）
+    content = f"{guidance}\n\n{result.customer_message}" if guidance else result.customer_message
+
     return {
-        "messages": [AIMessage(content=result.customer_message, name="escalation_agent")],
+        "messages": [AIMessage(content=content, name="escalation_agent")],
         "escalation_reason": reason,
         "handoff_summary": result.handoff_summary,
         "resolution": "escalated",
