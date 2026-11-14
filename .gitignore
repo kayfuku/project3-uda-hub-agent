@@ -32,6 +32,8 @@ pyvenv.cfg
 
 # Project specific
 .env
+# ChromaDB のインデックス（knowledge_search.py が udahub.db から自動で作り直す）
+solution/data/core/chroma/
 # sessions/
 # logs/
 *.log

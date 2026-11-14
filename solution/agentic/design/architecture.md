@@ -150,7 +150,7 @@ flowchart TD
         EMB2 -->|質問ベクトル| QUERY["collection.query(n_results=3)"]
         CHROMA -.-> QUERY
         QUERY -->|"上位3件と距離"| SCORE["confidence = 1 − 1位の距離<br/>（= コサイン類似度）"]
-        SCORE --> TH{confidence ≥ 0.45 ?}
+        SCORE --> TH{confidence ≥ 0.30 ?}
         TH -->|はい| ANS[上位3件を LLM に渡して回答を生成]
         TH -->|いいえ| ESC[Escalation Agent へ]
     end
@@ -161,15 +161,30 @@ flowchart TD
   - 起動時にコレクションが空なら、udahub.db の knowledge テーブルから記事を読み込んで登録する。記事を更新したときは、コレクションを作り直す。
   - 各ドキュメントの `id` は `article_id`、`metadata` には `title` と `tags` を入れる。
 - ChromaDB が返すのは **距離**（cosine 距離 = 1 − コサイン類似度）なので、**信頼度 = 1 − 1位の距離**（0〜1）として計算する。LLM の自己申告ではなく計算で出すので、同じ入力なら毎回同じ値になり、テストしやすい。
-- しきい値は暫定で `0.45` とする。テストケース（関係のある質問とない質問）で実際のスコアを見てから調整する。
+- しきい値は **`0.30`**。最初は暫定で `0.45` としていたが、実際のスコア（5.2 節）を見て下げた。
+  - `0.45` では「Can I get my money back?」（0.312）が、正しい記事（Refund Policy）を見つけているのにエスカレーションされてしまった。
+  - 関係のある質問は 0.312〜0.659、関係のない質問は 0.136〜0.253 だったので、その間の `0.30` にした。
+  - 境目は狭い（0.253 と 0.312）。短く曖昧な質問はエスカレーションされることがあるが、間違って答えるより人に回すほうが安全なので許容する。
 
-### 5.2 具体例（スコアは説明用の想定値）
+### 5.2 実測したスコア（2026-11-14、`text-embedding-3-small`）
 
 | 質問 | 1位の記事 | スコア | 結果 |
 |---|---|---|---|
-| 「QRコードが会場で読めない」 | QR Code Not Working at the Venue | 0.72 | 回答 |
-| 「パスワードを忘れた」 | How to Handle Login Issues? | 0.65 | 回答 |
-| 「ペットを連れて行ける？」 | What's Included in a CultPass Subscription | 0.28 | エスカレーション |
+| Do unused experiences carry over to next month? | Unused Monthly Experiences (Rollover) | 0.659 | 回答 |
+| The QR code won't scan at the museum entrance | QR Code Not Working at the Venue | 0.643 | 回答 |
+| I was charged twice this month | Unexpected or Duplicate Charges | 0.589 | 回答 |
+| How do I cancel my booking for tomorrow? | How to Cancel or Change a Reservation | 0.534 | 回答 |
+| The app keeps crashing on my phone | App Crashes or Won't Load | 0.530 | 回答 |
+| QRコードが読み取れません | QR Code Not Working at the Venue | 0.528 | 回答 |
+| How do I change my credit card? | How to Update Payment Method | 0.518 | 回答 |
+| I forgot my password and can't log in | How to Handle Login Issues? | 0.459 | 回答 |
+| Can I get my money back? | Refund Policy | 0.312 | 回答 |
+| Can I bring my dog to the concert? | How to Reserve a Spot for an Event | 0.253 | エスカレーション |
+| Do you sell gift cards? | Unused Monthly Experiences (Rollover) | 0.220 | エスカレーション |
+| I want to talk to your manager right now | How to Update Profile or Email Address | 0.201 | エスカレーション |
+| What's the weather like in Bahia next week? | QR Code Not Working at the Venue | 0.136 | エスカレーション |
+
+関係のある質問では、9件すべてで1位に正しい記事が来た（日本語の質問も含む）。
 
 ---
 
