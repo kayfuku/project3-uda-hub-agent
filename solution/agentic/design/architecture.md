@@ -1,388 +1,390 @@
-# UDA-Hub アーキテクチャ設計書
+# UDA-Hub Architecture Design
 
-## 1. 概要
+## 1. Overview
 
-UDA-Hub は、カスタマーサポートのチケットを自動で処理するマルチエージェントシステムである。
-最初の導入顧客は **CultPass**（文化体験のサブスクリプションサービス）。
+UDA-Hub is a multi-agent system that processes customer support tickets automatically.
+The first customer is **CultPass** (a subscription service for cultural experiences).
 
-- チケットを読み取って分類し、担当エージェントへ振り分ける
-- ナレッジ記事か CultPass DB の情報をもとに回答する
-- 自信を持って答えられないときや、人の判断が必要なときは、人間の担当者にエスカレーションする
+- Reads and classifies each ticket, then routes it to the right agent
+- Answers using knowledge articles or data from the CultPass DB
+- Escalates to a human agent when it cannot answer confidently or when human judgment is needed
 
-| 項目 | 採用するもの |
+| Item | Choice |
 |---|---|
-| オーケストレーション | LangGraph `StateGraph`（グラフはゼロから組み、`create_react_agent` などの既製ワークフローは使わない） |
-| LLM | OpenAI `gpt-5.4-mini`（Udacity の Vocareum 経由。`agentic/agents/llm.py` の `get_llm()` を4つのエージェントで共有） |
-| 埋め込みモデル | OpenAI `text-embedding-3-small`（ナレッジ検索用） |
-| ベクトル DB | ChromaDB（LangChain の `langchain_chroma.Chroma` 経由。ナレッジ記事の埋め込みを保存・検索） |
-| アーキテクチャパターン | **スーパーバイザー型**（Classifier が司令塔となり、専門エージェントに振り分ける） |
+| Orchestration | LangGraph `StateGraph` (the graph is built from scratch; no prebuilt workflows such as `create_react_agent`) |
+| LLM | OpenAI `gpt-5.4-mini` (via Udacity's Vocareum; `get_llm()` in `agentic/agents/llm.py` is shared by all four agents) |
+| Embedding model | OpenAI `text-embedding-3-small` (for knowledge search) |
+| Vector DB | ChromaDB (via LangChain's `langchain_chroma.Chroma`; stores and searches knowledge article embeddings) |
+| Architecture pattern | **Supervisor** (the Classifier acts as the supervisor and routes to specialist agents) |
 
 ---
 
-## 2. 全体図
+## 2. Overall Diagram
 
 ```mermaid
 flowchart TD
-    START([チケット受信]) --> LOAD[load_memory<br/>チケット情報と過去のやり取りを取得]
-    LOAD --> CLS[Classifier Agent<br/>分類・緊急度判定]
+    START([Ticket received]) --> LOAD[load_memory<br/>Fetch ticket info and past interactions]
+    LOAD --> CLS[Classifier Agent<br/>Classify and assess urgency]
 
-    CLS -->|knowledge| KNOW[Knowledge Agent<br/>RAG で記事検索 → 回答]
-    CLS -->|account| ACC[Account Agent<br/>CultPass DB を操作]
-    CLS -->|escalation| ESC[Escalation Agent<br/>人へ引き継ぎ]
+    CLS -->|knowledge| KNOW[Knowledge Agent<br/>Search articles with RAG → answer]
+    CLS -->|account| ACC[Account Agent<br/>Operate on the CultPass DB]
+    CLS -->|escalation| ESC[Escalation Agent<br/>Hand off to a human]
 
-    KNOW -->|解決| SAVE
-    KNOW -->|信頼度 < しきい値<br/>記事が人の対応を指示<br/>検索の失敗| ESC
+    KNOW -->|resolved| SAVE
+    KNOW -->|confidence < threshold<br/>article requires a human<br/>search failed| ESC
 
-    ACC -->|tool_calls あり| TOOLS[account_tools<br/>CultPass DB ツールを実行]
-    TOOLS -->|ツールの結果| ACC
-    TOOLS -->|ツールがエラー| ESC
-    ACC -->|最終回答| SAVE
-    ACC -->|ユーザー不明・ブロック済み| ESC
+    ACC -->|has tool_calls| TOOLS[account_tools<br/>Run CultPass DB tools]
+    TOOLS -->|tool results| ACC
+    TOOLS -->|tool error| ESC
+    ACC -->|final answer| SAVE
+    ACC -->|user not found / blocked| ESC
 
-    ESC --> SAVE[save_memory<br/>会話・結果を DB に保存]
-    SAVE --> END([回答を返す])
+    ESC --> SAVE[save_memory<br/>Save conversation and outcome to DB]
+    SAVE --> END([Return the answer])
 ```
 
-- 四角は **ノード**（LangGraph のグラフ上の処理単位）を表す。
-- 矢印のラベルは **条件付きエッジ**（ルーティングの判断）を表す。エスカレーションに進むかどうかは、各ノードが State に `escalation_reason` を入れたかどうかで決める（`workflow.py` の `route_after_*` 関数）。
-- 4つのエージェントは `Classifier`、`Knowledge`、`Account`、`Escalation`。`load_memory`、`save_memory`、`account_tools` はエージェントではなく、補助ノードとして扱う。
-- エージェントの本体は `agentic/agents/` にある「State を受け取り、更新する項目だけを返す関数」。`workflow.py` はそれをノードとして並べ、条件付きエッジでつなぐ。
+- Boxes are **nodes** (units of processing in the LangGraph graph).
+- Arrow labels are **conditional edges** (routing decisions). Whether to go to escalation is decided by whether a node has set `escalation_reason` in the State (the `route_after_*` functions in `workflow.py`).
+- The four agents are `Classifier`, `Knowledge`, `Account`, and `Escalation`. `load_memory`, `save_memory`, and `account_tools` are not agents; they are helper nodes.
+- Each agent is a function in `agentic/agents/` that "takes the State and returns only the fields it updates". `workflow.py` places them as nodes and connects them with conditional edges.
 
 ---
 
-## 3. エージェントの役割と責任
+## 3. Agent Roles and Responsibilities
 
-### 3.1 Classifier Agent（スーパーバイザー）
+### 3.1 Classifier Agent (Supervisor)
 
-| 項目 | 内容 |
+| Item | Details |
 |---|---|
-| 責任 | チケットの内容とメタデータから、行き先と緊急度を決める |
-| 入力 | 最新のユーザーメッセージ、直前の会話（ユーザーと AI の本文、最大6件）、チケットのメタデータ（`channel`、`main_issue_type`、`tags`、`created_at`）、過去のやり取りの要約（`past_context`） |
-| 出力 | `category`（`knowledge` / `account` / `escalation`）、`urgency`（`low` / `medium` / `high`）、`reason`（判断理由。State には `classification_reason` として入れる） |
-| 方法 | LLM の構造化出力（Pydantic モデル `Classification`） |
+| Responsibility | Decide the destination and urgency from the ticket content and metadata |
+| Input | Latest user message, recent conversation (user and AI message text, up to 6), ticket metadata (`channel`, `main_issue_type`, `tags`, `created_at`), summary of past interactions (`past_context`) |
+| Output | `category` (`knowledge` / `account` / `escalation`), `urgency` (`low` / `medium` / `high`), `reason` (the rationale; stored in the State as `classification_reason`) |
+| Method | LLM structured output (Pydantic model `Classification`) |
 
-直前の会話を渡すのは、「Yes, please cancel it」のような短い返事を、その前の質問と同じ行き先に振り分けるためである。
+The recent conversation is passed so that short replies such as "Yes, please cancel it" are routed to the same destination as the preceding question.
 
-分類の基準は次のとおり。
+Classification criteria:
 
-| category | 該当するチケット | 例 |
+| category | Tickets that belong here | Examples |
 |---|---|---|
-| `knowledge` | 一般的な質問や手順の質問。ユーザー個別のデータは不要。請求・支払い・返金の質問もここに入れる（アカウントのツールには請求データがないため） | 「QRコードが読み取れない」「サブスクに何が含まれる？」「今月2回請求された」 |
-| `account` | そのユーザー自身のデータを見たり、変更したりする必要がある。自分のプランの内容（プラン名、月に使える体験の数）もここに入れる（利用枠はユーザーごとに違い、正しい値はアカウントのデータにしかないため） | 「私の予約を確認したい」「来週の予約をキャンセルして」「私のプランで月に何回使える？」 |
-| `escalation` | 人の判断が必要。明確な苦情、法的な話、人間との会話を希望 | 「責任者と話したい」「弁護士に相談する」 |
+| `knowledge` | General or how-to questions that do not need user-specific data. Billing, payment, and refund questions also go here (the account tools have no billing data) | "The QR code won't scan", "What does the subscription include?", "I was charged twice this month" |
+| `account` | Requires viewing or changing the user's own data. Questions about the user's own plan (plan name, experiences per month) also go here (quotas differ per user, and the correct value exists only in the account data) | "I want to check my reservations", "Cancel my booking for next week", "How many experiences per month does my plan include?" |
+| `escalation` | Needs human judgment: clear complaints, legal matters, requests to talk to a human | "I want to speak to a manager", "I'll talk to my lawyer" |
 
-緊急度の基準は次のとおり。
+Urgency criteria:
 
-| urgency | 該当するチケット |
+| urgency | Tickets that belong here |
 |---|---|
-| `high` | ユーザーが怒っている、法的な話をしている、イベントが今日か明日に迫っている |
-| `medium` | サービスが使えない、アカウントの操作が必要 |
-| `low` | 急ぎではない一般的な質問 |
+| `high` | The user is angry, mentions legal matters, or the event is today or tomorrow |
+| `medium` | The service is unusable, or an account operation is needed |
+| `low` | General questions that are not urgent |
 
 ### 3.2 Knowledge Agent
 
-| 項目 | 内容 |
+| Item | Details |
 |---|---|
-| 責任 | ナレッジ記事を検索し、**記事の内容だけ**に基づいて回答する |
-| 入力 | 最新のユーザーメッセージ、`past_context` |
-| 出力 | 回答文（`AIMessage`）、`retrieved_articles`（検索した記事のタイトルとスコア）、`confidence`（信頼度） |
-| 方法 | RAG（第5章）。① `search_knowledge` をコードで直接呼ぶ（LLM のツール呼び出しにはしない）。② 信頼度がしきい値未満なら、LLM を呼ばずにエスカレーションする。③ しきい値以上なら、上位3件を LLM に渡し、構造化出力（`KnowledgeAnswer`）で回答させる。記事にない内容は答えないよう指示する |
-| エスカレーション条件 | 検索が失敗したとき。`confidence` がしきい値未満のとき。LLM が `needs_escalation = True` を返したとき（記事自体がエスカレーションを指示していて、ユーザーの状況がその条件に当てはまる。または、記事に答えがない） |
+| Responsibility | Search knowledge articles and answer **based only on the article content** |
+| Input | Latest user message, `past_context` |
+| Output | Answer text (`AIMessage`), `retrieved_articles` (titles and scores of the retrieved articles), `confidence` |
+| Method | RAG (Section 5). ① Call `search_knowledge` directly in code (not as an LLM tool call). ② If confidence is below the threshold, escalate without calling the LLM. ③ Otherwise, pass the top 3 articles to the LLM and have it answer with structured output (`KnowledgeAnswer`). The LLM is instructed not to answer anything that is not in the articles |
+| Escalation conditions | The search failed. `confidence` is below the threshold. The LLM returned `needs_escalation = True` (the article itself requires escalation and the user's situation meets that condition, or the articles contain no answer) |
 
-- 記事が「まず手順を試し、それでもだめなら人へ」となっている場合（例：QR コードが読めない）は、手順を案内して `resolved` にする。ユーザーは、うまくいかなければ再度問い合わせればよい。
-- 記事の条件にすでに当てはまる場合（例：同じ月に2回請求された）は、記事の案内を返したうえでエスカレーションする。
+- If an article says "try these steps first, and contact a human if they don't work" (e.g., the QR code won't scan), the agent gives the steps and marks the ticket `resolved`. The user can contact support again if it doesn't work.
+- If the user already meets the article's condition (e.g., charged twice in the same month), the agent returns the article's guidance and then escalates.
 
 ### 3.3 Account Agent
 
-| 項目 | 内容 |
+| Item | Details |
 |---|---|
-| 責任 | ツールで CultPass DB を照会・操作し、ユーザー個別の依頼を処理する |
-| 入力 | 会話全体（`messages`）、チケットのユーザーに対応する CultPass の `user_id` |
-| 出力 | ツールの結果をもとにした回答文 |
-| 方法 | ① `get_user_profile(user_id)` をコードで直接呼び、ユーザーの有無とブロックを確認する（LLM には任せない）。② LLM にツールを渡し（`bind_tools`）、`account ⇄ account_tools` のループで呼び出す。ループはグラフ上に自分で組む。③ `account_tools` は、LLM が指定した `user_id` を State の値で上書きしてから実行する（他人のデータを操作させないため） |
-| エスカレーション条件 | ユーザーが見つからない、アカウントがブロックされている（`is_blocked`）— `account` ノードで判定。ツールがエラーを返した（`ok: False`）— `account_tools` ノードで判定 |
+| Responsibility | Query and operate on the CultPass DB through tools to handle user-specific requests |
+| Input | The full conversation (`messages`), the CultPass `user_id` of the ticket's user |
+| Output | An answer based on the tool results |
+| Method | ① Call `get_user_profile(user_id)` directly in code to check that the user exists and is not blocked (this is not left to the LLM). ② Give the tools to the LLM (`bind_tools`) and call them in an `account ⇄ account_tools` loop, built explicitly in the graph. ③ `account_tools` overwrites the `user_id` given by the LLM with the value from the State before running the tool (so it cannot operate on another user's data) |
+| Escalation conditions | User not found, or the account is blocked (`is_blocked`) — checked in the `account` node. A tool returned an error (`ok: False`) — checked in the `account_tools` node |
 
-- LLM に渡すツールは `get_subscription`、`get_reservations`、`cancel_reservation` の3つ。`get_user_profile` は①でコードが呼ぶので渡さない。
-- キャンセルの対象がはっきりしないときは、キャンセルせずにユーザーに確認するよう指示している。
+- Three tools are given to the LLM: `get_subscription`, `get_reservations`, and `cancel_reservation`. `get_user_profile` is not given because the code calls it in ①.
+- When it is unclear which reservation to cancel, the agent is instructed to ask the user instead of cancelling.
 
 ### 3.4 Escalation Agent
 
-| 項目 | 内容 |
+| Item | Details |
 |---|---|
-| 責任 | 人間の担当者に引き継ぐ。担当者がすぐ対応できるよう要約を残す |
-| 入力 | 会話全体、エスカレーションの理由（`escalation_reason`。Classifier から直接来たときは `classification_reason`）、緊急度、`past_context`、このターンで先に出した案内（あれば） |
-| 出力 | ユーザー向けのメッセージ（ユーザーの言語。「担当者が対応します」）、担当者向けの要約（`handoff_summary`、英語） |
-| 方法 | LLM の構造化出力（`EscalationOutput`）。最初に `customer_language` を答えさせて、返信の言語を先に決めさせる |
-| 副作用 | なし。DB への書き込み（`status` を `escalated` にする、要約を保存する、緊急度をタグに記録する）は `save_memory` が行う（第7章） |
+| Responsibility | Hand off to a human agent, leaving a summary so they can act quickly |
+| Input | The full conversation, the escalation reason (`escalation_reason`; `classification_reason` when coming directly from the Classifier), urgency, `past_context`, any guidance already given earlier in this turn |
+| Output | A message for the user (in the user's language: "A support agent will follow up"), a summary for the human agent (`handoff_summary`, in English) |
+| Method | LLM structured output (`EscalationOutput`). The model answers `customer_language` first, so the reply language is decided up front |
+| Side effects | None. DB writes (setting `status` to `escalated`, saving the summary, recording urgency as a tag) are done by `save_memory` (Section 7) |
 
-- ユーザー向けのメッセージには、信頼度やツール名、エラー内容、「ブロック」などの内部の情報を書かない。
-- Knowledge が先に案内を出してからここに来た場合（例：二重請求）、その案内を引き継ぎのメッセージの前にコードでつなぐ。`chat_interface` は最後のメッセージしか表示しないためである。
+- The user-facing message does not include internal information such as confidence, tool names, error details, or "blocked".
+- If the Knowledge Agent has already given guidance before arriving here (e.g., duplicate charges), the code prepends that guidance to the handoff message, because `chat_interface` only displays the last message.
 
 ---
 
-## 4. 状態（State）と情報の流れ
+## 4. State and Information Flow
 
-すべてのノードは、次の共通の状態を読み書きする（`agentic/state.py`）。
-LangGraph の `MessagesState` を継承するので、会話の履歴を持つ `messages` フィールド（短期メモリ）はそちらで定義済みになる。新しいメッセージは既存のリストに追記される。
+All nodes read and write the following shared State (`agentic/state.py`).
+It inherits from LangGraph's `MessagesState`, so the `messages` field that holds the conversation history (short-term memory) is already defined there. New messages are appended to the existing list.
 
 ```python
 from langgraph.graph import MessagesState
 
 class SupportState(MessagesState):
-    # messages: Annotated[list[AnyMessage], add_messages]  ← MessagesState から継承（会話＝短期メモリ）
+    # messages: Annotated[list[AnyMessage], add_messages]  ← inherited from MessagesState (conversation = short-term memory)
     ticket_id: str                    # = thread_id
-    user_id: str                      # CultPass 側のユーザー ID
-    ticket_metadata: dict             # channel, main_issue_type, tags など
-    past_context: str                 # 過去のやり取りの要約（長期メモリ）
-    category: str                     # Classifier の分類結果（knowledge / account / escalation）
+    user_id: str                      # CultPass user ID
+    ticket_metadata: dict             # channel, main_issue_type, tags, etc.
+    past_context: str                 # summary of past interactions (long-term memory)
+    category: str                     # Classifier result (knowledge / account / escalation)
     urgency: str                      # low / medium / high
-    classification_reason: str        # Classifier の判断理由
-    retrieved_articles: list[dict]    # 検索した記事とスコア
-    confidence: float                 # Knowledge の信頼度
-    escalation_reason: str | None     # エスカレーションの理由
-    handoff_summary: str              # 担当者向けの引き継ぎの要約（Escalation が書く）
+    classification_reason: str        # Classifier's rationale
+    retrieved_articles: list[dict]    # retrieved articles and scores
+    confidence: float                 # Knowledge confidence
+    escalation_reason: str | None     # reason for escalation
+    handoff_summary: str              # handoff summary for the human agent (written by Escalation)
     resolution: str                   # resolved / escalated
 ```
 
-- グラフに渡すのは `messages` と `thread_id`（= `ticket_id`）だけ。`user_id` と `ticket_metadata` は、`load_memory` が `ticket_id` から udahub.db を引いて State に入れる。
-- `MemorySaver` は State を丸ごと残すので、`load_memory` はターンの最初に `category` から `resolution` までの「ターンごとの結果」をリセットする。リセットしないと、前のターンの `escalation_reason` が残って間違った行き先に進んでしまう。
+- Only `messages` and `thread_id` (= `ticket_id`) are passed to the graph. `load_memory` looks up udahub.db by `ticket_id` and puts `user_id` and `ticket_metadata` into the State.
+- `MemorySaver` keeps the entire State, so `load_memory` resets the per-turn results (`category` through `resolution`) at the start of each turn. Without the reset, the previous turn's `escalation_reason` would remain and send the ticket to the wrong destination.
 
-具体例として、「来週の予約をキャンセルしたい」というチケットの処理を順に追う。
+As a concrete example, here is how the ticket "I want to cancel my reservation for next week" is processed, step by step:
 
 ```
-① load_memory      ticket_id から user_id を取得。past_context = "- 2026-11-10 [resolved] ...: "The QR code won't scan..." → ..."
+① load_memory      Get user_id from ticket_id. past_context = "- 2026-11-10 [resolved] ...: "The QR code won't scan..." → ..."
 ② classifier       category = "account", urgency = "medium"
-③ account          get_user_profile(user_id) をコードで確認 → OK。LLM が get_reservations(user_id) を呼ぶ
+③ account          Check get_user_profile(user_id) in code → OK. The LLM calls get_reservations(user_id)
 ④ account_tools    → {"ok": true, "data": [{"reservation_id": "r1", ...}]}
-⑤ account          LLM が cancel_reservation(user_id, "r1") を呼ぶ
+⑤ account          The LLM calls cancel_reservation(user_id, "r1")
 ⑥ account_tools    → {"ok": true, "data": {"status": "cancelled", "within_24h": false, ...}}
-⑦ account          回答「予約をキャンセルしました。クレジットは戻ります」 resolution = "resolved"
-⑧ save_memory      ticket_messages に会話を保存し、status = "resolved"、main_issue_type = "account"、tags = "urgency:medium" にする
+⑦ account          Answer: "Your reservation has been cancelled. Your credit will be returned."  resolution = "resolved"
+⑧ save_memory      Save the conversation to ticket_messages; set status = "resolved", main_issue_type = "account", tags = "urgency:medium"
 ```
 
 ---
 
-## 5. ナレッジ検索（RAG）と信頼度スコア
+## 5. Knowledge Search (RAG) and Confidence Score
 
-### 5.1 仕組み
+### 5.1 How It Works
 
 ```mermaid
 flowchart TD
-    subgraph INDEX["【準備】インデックス作成（コレクションが空のときに1回だけ）"]
-        KB[(udahub.db<br/>knowledge テーブル 14件)] -->|"title + tags + content を<br/>1つの文字列にする"| EMB1[text-embedding-3-small]
-        EMB1 -->|"記事ベクトル ×14<br/>＋ metadata: article_id, title, tags"| CHROMA[(ChromaDB<br/>collection: knowledge<br/>距離: cosine)]
+    subgraph INDEX["[Setup] Build the index (once, when the collection is empty)"]
+        KB[(udahub.db<br/>knowledge table, 14 articles)] -->|"join title + tags + content<br/>into one string"| EMB1[text-embedding-3-small]
+        EMB1 -->|"article vectors ×14<br/>+ metadata: article_id, title, tags"| CHROMA[(ChromaDB<br/>collection: knowledge<br/>distance: cosine)]
     end
 
-    subgraph SEARCH["【検索】チケットごとに実行"]
-        Q[ユーザーの質問] --> EMB2[text-embedding-3-small]
-        EMB2 -->|質問ベクトル| QUERY["similarity_search_with_score(k=3)"]
+    subgraph SEARCH["[Search] Run for each ticket"]
+        Q[User question] --> EMB2[text-embedding-3-small]
+        EMB2 -->|question vector| QUERY["similarity_search_with_score(k=3)"]
         CHROMA -.-> QUERY
-        QUERY -->|"上位3件と距離"| SCORE["confidence = 1 − 1位の距離<br/>（= コサイン類似度）"]
+        QUERY -->|"top 3 and distances"| SCORE["confidence = 1 − top-1 distance<br/>(= cosine similarity)"]
         SCORE --> TH{confidence ≥ 0.30 ?}
-        TH -->|はい| ANS[上位3件を LLM に渡して回答を生成]
-        TH -->|いいえ| ESC[Escalation Agent へ]
+        TH -->|yes| ANS[Pass the top 3 to the LLM and generate an answer]
+        TH -->|no| ESC[To the Escalation Agent]
     end
 ```
 
-- **ChromaDB** を LangChain の `Chroma`（`langchain_chroma`）経由で使い、`solution/data/core/chroma/` にコレクション `knowledge` として永続化する（`agentic/tools/knowledge_search.py`）。
-  - コレクションは距離の種類を `cosine` にして作る（`collection_metadata={"hnsw:space": "cosine"}`）。
-  - 起動時にコレクションが空なら、udahub.db の knowledge テーブルから記事を読み込んで登録する。記事を更新したときは、`get_vector_store(rebuild=True)` でコレクションを作り直す。
-  - 各ドキュメントの `id` は `article_id`、`metadata` には `article_id`、`title`、`tags` を入れる。
-- ChromaDB が返すのは **距離**（cosine 距離 = 1 − コサイン類似度）なので、**信頼度 = 1 − 1位の距離**（0〜1）として計算する。LLM の自己申告ではなく計算で出すので、同じ入力なら毎回同じ値になり、テストしやすい。
-- しきい値は **`0.30`**（`CONFIDENCE_THRESHOLD`）。最初は暫定で `0.45` としていたが、実際のスコア（5.2 節）を見て下げた。
-  - `0.45` では「Can I get my money back?」（0.312）が、正しい記事（Refund Policy）を見つけているのにエスカレーションされてしまった。
-  - 関係のある質問は 0.312〜0.659、関係のない質問は 0.136〜0.253 だったので、その間の `0.30` にした。
-  - 境目は狭い（0.253 と 0.312）。短く曖昧な質問はエスカレーションされることがあるが、間違って答えるより人に回すほうが安全なので許容する。
-- しきい値以上でも、LLM が「記事に答えがない」「記事が人の対応を指示している」と判断したときはエスカレーションする（3.2 節）。
+- **ChromaDB** is used through LangChain's `Chroma` (`langchain_chroma`) and persisted as the collection `knowledge` in `solution/data/core/chroma/` (`agentic/tools/knowledge_search.py`).
+  - The collection is created with the `cosine` distance (`collection_metadata={"hnsw:space": "cosine"}`).
+  - If the collection is empty at startup, articles are loaded from the knowledge table in udahub.db and added. When articles are updated, rebuild the collection with `get_vector_store(rebuild=True)`.
+  - Each document's `id` is the `article_id`, and its `metadata` holds `article_id`, `title`, and `tags`.
+- ChromaDB returns a **distance** (cosine distance = 1 − cosine similarity), so **confidence = 1 − top-1 distance** (0 to 1). Because it is computed rather than self-reported by the LLM, the same input always gives the same value, which makes it easy to test.
+- The threshold is **`0.30`** (`CONFIDENCE_THRESHOLD`). It was provisionally set to `0.45` at first, then lowered after looking at actual scores (Section 5.2).
+  - With `0.45`, "Can I get my money back?" (0.312) was escalated even though it had found the correct article (Refund Policy).
+  - Relevant questions scored 0.312–0.659 and irrelevant ones 0.136–0.253, so `0.30` was chosen between them.
+  - The margin is narrow (0.253 vs. 0.312). Short, vague questions may get escalated, but this is acceptable because handing off to a human is safer than answering incorrectly.
+- Even above the threshold, the ticket is escalated when the LLM judges that "the articles contain no answer" or "the article requires a human" (Section 3.2).
 
-### 5.2 実測したスコア（2026-11-14、`text-embedding-3-small`）
+### 5.2 Measured Scores (2026-11-14, `text-embedding-3-small`)
 
-| 質問 | 1位の記事 | スコア | 結果 |
+| Question | Top-1 article | Score | Result |
 |---|---|---|---|
-| Do unused experiences carry over to next month? | Unused Monthly Experiences (Rollover) | 0.659 | 回答 |
-| The QR code won't scan at the museum entrance | QR Code Not Working at the Venue | 0.643 | 回答 |
-| I was charged twice this month | Unexpected or Duplicate Charges | 0.589 | 回答 |
-| How do I cancel my booking for tomorrow? | How to Cancel or Change a Reservation | 0.534 | 回答 |
-| The app keeps crashing on my phone | App Crashes or Won't Load | 0.530 | 回答 |
-| QRコードが読み取れません | QR Code Not Working at the Venue | 0.528 | 回答 |
-| How do I change my credit card? | How to Update Payment Method | 0.518 | 回答 |
-| I forgot my password and can't log in | How to Handle Login Issues? | 0.459 | 回答 |
-| Can I get my money back? | Refund Policy | 0.312 | 回答 |
-| Can I bring my dog to the concert? | How to Reserve a Spot for an Event | 0.253 | エスカレーション |
-| Do you sell gift cards? | Unused Monthly Experiences (Rollover) | 0.220 | エスカレーション |
-| I want to talk to your manager right now | How to Update Profile or Email Address | 0.201 | エスカレーション |
-| What's the weather like in Bahia next week? | QR Code Not Working at the Venue | 0.136 | エスカレーション |
+| Do unused experiences carry over to next month? | Unused Monthly Experiences (Rollover) | 0.659 | Answer |
+| The QR code won't scan at the museum entrance | QR Code Not Working at the Venue | 0.643 | Answer |
+| I was charged twice this month | Unexpected or Duplicate Charges | 0.589 | Answer |
+| How do I cancel my booking for tomorrow? | How to Cancel or Change a Reservation | 0.534 | Answer |
+| The app keeps crashing on my phone | App Crashes or Won't Load | 0.530 | Answer |
+| QRコードが読み取れません (Japanese: "The QR code can't be read") | QR Code Not Working at the Venue | 0.528 | Answer |
+| How do I change my credit card? | How to Update Payment Method | 0.518 | Answer |
+| I forgot my password and can't log in | How to Handle Login Issues? | 0.459 | Answer |
+| Can I get my money back? | Refund Policy | 0.312 | Answer |
+| Can I bring my dog to the concert? | How to Reserve a Spot for an Event | 0.253 | Escalation |
+| Do you sell gift cards? | Unused Monthly Experiences (Rollover) | 0.220 | Escalation |
+| I want to talk to your manager right now | How to Update Profile or Email Address | 0.201 | Escalation |
+| What's the weather like in Bahia next week? | QR Code Not Working at the Venue | 0.136 | Escalation |
 
-関係のある質問では、9件すべてで1位に正しい記事が来た（日本語の質問も含む）。
+For all 9 relevant questions, the correct article came first (including the Japanese question).
 
 ---
 
-## 6. ツール（CultPass DB の抽象化）
+## 6. Tools (Abstraction over the CultPass DB)
 
-`agentic/tools/cultpass_tools.py` に LangChain の `@tool` 関数として実装する。
+Implemented as LangChain `@tool` functions in `agentic/tools/cultpass_tools.py`.
 
-| ツール | 入力 | 出力（`data`） | 主なバリデーション |
+| Tool | Input | Output (`data`) | Main validations |
 |---|---|---|---|
-| `get_user_profile` | `user_id` | `user_id`、`is_blocked` | ユーザーが存在するか |
-| `get_subscription` | `user_id` | `status`、`tier`、`monthly_quota`、開始日・終了日 | ユーザーが存在するか、サブスクがあるか |
-| `get_reservations` | `user_id` | 予約一覧（`reservation_id`、体験名、場所、日時、プレミアムかどうか、ステータス）。0件なら空リスト | ユーザーが存在するか |
-| `cancel_reservation` | `user_id`、`reservation_id` | 体験名、変更後のステータス、`within_24h` | ユーザーが存在するか、ブロックされていないか、予約が存在するか、そのユーザーのものか、キャンセル済みでないか、イベントが始まっていないか |
+| `get_user_profile` | `user_id` | `user_id`, `is_blocked` | The user exists |
+| `get_subscription` | `user_id` | `status`, `tier`, `monthly_quota`, start and end dates | The user exists, a subscription exists |
+| `get_reservations` | `user_id` | List of reservations (`reservation_id`, experience title, location, date/time, whether premium, status). Empty list if none | The user exists |
+| `cancel_reservation` | `user_id`, `reservation_id` | Experience title, new status, `within_24h` | The user exists, is not blocked, the reservation exists, belongs to the user, is not already cancelled, and the event has not started |
 
-- `cancel_reservation` は、ナレッジ記事「How to Cancel or Change a Reservation」のルールに合わせて、開始まで24時間を切っていてもキャンセルできる。そのときは `within_24h = True` を返し、クレジットが消費されることをエージェントがユーザーに伝える。キャンセルすると、体験の空き枠（`slots_available`）を1つ戻す。
-- `get_user_profile` は Account Agent がコードで直接呼ぶ（3.3 節）。LLM に渡すのは残りの3つ。
+- Following the rules in the knowledge article "How to Cancel or Change a Reservation", `cancel_reservation` allows cancellation even within 24 hours of the start. In that case it returns `within_24h = True`, and the agent tells the user that the credit will be consumed. Cancelling returns one slot to the experience (`slots_available`).
+- `get_user_profile` is called directly in code by the Account Agent (Section 3.3). The other three are given to the LLM.
 
-**共通の返り値の形**（構造化された応答）:
+**Common return shape** (structured response):
 
 ```python
-{"ok": True,  "data": {...}}                       # 成功
-{"ok": False, "error": "Reservation not found"}    # 失敗（例外は投げずに返す）
+{"ok": True,  "data": {...}}                       # success
+{"ok": False, "error": "Reservation not found"}    # failure (returned, not raised)
 ```
 
-- 同じ形を、ナレッジ検索（`knowledge_search.py`）と長期メモリ（`memory.py`）の関数でも使う。
-- cultpass.db への接続は `cultpass_tools.py` の1か所にまとめる。パスは `__file__` を基準にした絶対パスで解決し、ノートブックをどこから実行しても動くようにする。DB ファイルがないときは、空の DB を作らずにエラーを返す。
-- エージェントは SQL を直接書かない。ツールを通してだけ DB を触る。
+- The same shape is used by the knowledge search (`knowledge_search.py`) and long-term memory (`memory.py`) functions.
+- The connection to cultpass.db is kept in one place, `cultpass_tools.py`. The path is resolved as an absolute path based on `__file__`, so it works no matter where the notebook is run from. If the DB file does not exist, an error is returned instead of creating an empty DB.
+- Agents never write SQL directly. They touch the DB only through tools.
 
-### 6.1 MCP への移行を見据えた構成
+### 6.1 Structure Designed for a Future Move to MCP
 
-指示書では、ツールに MCP サーバーを使うことが推奨されている。まずは理解しやすさを優先して通常の関数ツールで作る。ただし、後から MCP サーバーに置き換えられるよう、ツールを次の2層に分けておく。
+The instructions recommend using an MCP server for tools. For ease of understanding, the tools are first built as regular function tools. However, so that they can later be replaced with an MCP server, they are split into the following two layers.
 
 ```mermaid
 flowchart LR
-    subgraph NOW["現在：関数ツール"]
-        A1[Account Agent] -->|bind_tools| W1["@tool ラッパー<br/>cultpass_tools.py"]
+    subgraph NOW["Now: function tools"]
+        A1[Account Agent] -->|bind_tools| W1["@tool wrappers<br/>cultpass_tools.py"]
     end
-    subgraph LATER["将来：MCP"]
-        A2[Account Agent] -->|MCP クライアント| W2["MCP サーバー<br/>@mcp.tool ラッパー"]
+    subgraph LATER["Later: MCP"]
+        A2[Account Agent] -->|MCP client| W2["MCP server<br/>@mcp.tool wrappers"]
     end
-    W1 --> CORE["DB 操作の本体<br/>（普通の Python 関数。<br/>dict を返す）"]
+    W1 --> CORE["Core DB operations<br/>(plain Python functions<br/>returning dicts)"]
     W2 --> CORE
     CORE --> DB[(cultpass.db)]
 ```
 
-- **DB 操作の本体**：引数を受け取って `{"ok", "data"/"error"}` の dict を返す、普通の Python 関数にする。LangChain にも MCP にも依存させない。
-- **ラッパー**：本体を呼ぶだけの薄い層にする。今は LangChain の `@tool` で包む（`get_user_profile_tool` など。LLM に見える名前は本体と同じ）。MCP に移るときは、同じ本体を MCP サーバー（例：`FastMCP` の `@mcp.tool`）で包み直せばよい。
-- こうしておけば、MCP に移行しても DB 操作のロジックとテストはそのまま使える。
-- `knowledge_search.py` にも同じ形のラッパー（`search_knowledge_tool`）を用意している。ただし Knowledge Agent は、確実に検索させるため本体の `search_knowledge` を直接呼ぶ。
+- **Core DB operations**: plain Python functions that take arguments and return a `{"ok", "data"/"error"}` dict. They depend on neither LangChain nor MCP.
+- **Wrappers**: a thin layer that only calls the core functions. For now they are wrapped with LangChain's `@tool` (e.g., `get_user_profile_tool`; the name visible to the LLM is the same as the core function). To move to MCP, wrap the same core functions again with an MCP server (e.g., `FastMCP`'s `@mcp.tool`).
+- This way, the DB logic and its tests can be reused as-is after moving to MCP.
+- `knowledge_search.py` also has a wrapper of the same form (`search_knowledge_tool`). However, the Knowledge Agent calls the core `search_knowledge` directly so that the search always runs.
 
 ---
 
-## 7. メモリ
+## 7. Memory
 
-| 種類 | スコープ | 保存先 | 中身 | 使い方 |
+| Type | Scope | Storage | Contents | Usage |
 |---|---|---|---|---|
-| 短期メモリ | `thread_id`（= `ticket_id`） | LangGraph `MemorySaver` | 同じチケット内の会話、ツール呼び出しとその結果、State | 同じチケットで会話を続けるときの文脈 |
-| 長期メモリ | ユーザー（`user_id`） | udahub.db（`ticket_messages`、`ticket_metadata`） | 過去のチケットの会話、解決・エスカレーションの結果、担当者向けの要約 | `load_memory` が同じユーザーの過去チケットを取り出し、`past_context` として Classifier、Knowledge、Escalation に渡す |
+| Short-term memory | `thread_id` (= `ticket_id`) | LangGraph `MemorySaver` | Conversation within the same ticket, tool calls and their results, State | Context when continuing the conversation on the same ticket |
+| Long-term memory | User (`user_id`) | udahub.db (`ticket_messages`, `ticket_metadata`) | Conversations from past tickets, resolved/escalated outcomes, handoff summaries | `load_memory` retrieves the same user's past tickets and passes them as `past_context` to the Classifier, Knowledge, and Escalation agents |
 
-長期メモリの読み書きは `agentic/tools/memory.py` の関数で行う。LLM がツールとして呼ぶのではなく、グラフのノード（`load_memory` / `save_memory`）が呼ぶので、`@tool` ラッパーは作らない。
+Long-term memory is read and written by the functions in `agentic/tools/memory.py`. They are called by graph nodes (`load_memory` / `save_memory`), not by the LLM as tools, so no `@tool` wrappers are created.
 
-**チケットの作成**
+**Creating a ticket**
 
-- 新しい問い合わせは `new_ticket(user_id)`（`workflow.py`）で始める。udahub.db にチケットと `ticket_metadata`（`status = open`）を作り、`ticket_id` を返す。この `ticket_id` を `thread_id` としてグラフを呼ぶ。
-- udahub.db にまだいないユーザーなら、ユーザーも作る（名前などの個人情報は増やさない）。
+- A new inquiry starts with `new_ticket(user_id)` (`workflow.py`). It creates a ticket and its `ticket_metadata` (`status = open`) in udahub.db and returns the `ticket_id`. The graph is then invoked with this `ticket_id` as the `thread_id`.
+- If the user does not yet exist in udahub.db, the user is also created (without adding personal information such as names).
 
-**読み込み（`load_memory`）**
+**Loading (`load_memory`)**
 
-- `thread_id` からチケットを引き、CultPass の `user_id` と `ticket_metadata` を State に入れる。
-- 同じユーザーの過去のチケット（今のチケットを除く）を新しい順に最大3件取り出し、日付、結果、分類、最初のユーザーの発言と最後の AI の発言（各150文字まで）を短い文章にまとめて `past_context` にする。初めてのユーザーは「No past tickets from this customer.」になる。
-- DB の関数がエラーを返してもグラフは止めない（`user_id` が空なら、Account Agent がエスカレーションする）。
+- Looks up the ticket from `thread_id` and puts the CultPass `user_id` and `ticket_metadata` into the State.
+- Retrieves up to 3 of the same user's past tickets (excluding the current one), newest first, and summarizes each as a short line with the date, outcome, category, the first user message, and the last AI message (up to 150 characters each) into `past_context`. For a first-time user it is "No past tickets from this customer."
+- The graph does not stop even if a DB function returns an error (if `user_id` is empty, the Account Agent escalates).
 
-**保存（`save_memory`）** — udahub.db に書くのはこのノードだけ（エージェントは書かない）。
+**Saving (`save_memory`)** — this is the only node that writes to udahub.db (agents do not write).
 
-- 会話のうち、ユーザーの発言と本文のある AI の発言を `ticket_messages` に保存する。ツールの呼び出しや結果は短期メモリで確認できるので入れない。`message.id` で重複を飛ばすので、同じチケットで会話が続いても二重に保存しない。
-- エスカレーションしたときは、`handoff_summary` を `role = system`（`[Handoff] ...`）で `ticket_messages` に保存する。`past_context` には user と ai の発言しか使わないので、要約は混ざらない。
-- `ticket_metadata` の `status` をそのターンの結果（`resolved` / `escalated`、結果がなければ `open`）で上書きする。ただし一度 `escalated` になったチケットは `escalated` のままにする（担当者の対応待ちが、次のターンの `resolved` で見えなくならないように）。
-- `main_issue_type` に Classifier の `category` を、`tags` に `urgency:<緊急度>` を記録する。
+- Saves the user messages and the AI messages with text content to `ticket_messages`. Tool calls and results are not saved, since they can be checked in short-term memory. Duplicates are skipped by `message.id`, so messages are not saved twice when the conversation continues on the same ticket.
+- When escalated, `handoff_summary` is saved to `ticket_messages` with `role = system` (`[Handoff] ...`). Because `past_context` uses only user and AI messages, the summary does not leak into it.
+- Overwrites `status` in `ticket_metadata` with the turn's outcome (`resolved` / `escalated`, or `open` if there is no outcome). However, once a ticket becomes `escalated`, it stays `escalated` (so that a ticket waiting for a human is not hidden by a `resolved` in a later turn).
+- Records the Classifier's `category` in `main_issue_type`, and `urgency:<urgency>` in `tags`.
 
-**例**：前回「QRコードが読めない」で解決したユーザーが再び来たら、`past_context` にそのチケットが入るので、「前回も QR コードの件でお問い合わせいただきました」と文脈を踏まえて応答できる。
+**Example**: When a user whose previous ticket "The QR code won't scan" was resolved comes back, that ticket is included in `past_context`, so the agent can respond with context, e.g., "You also contacted us about a QR code issue last time."
 
-`thread_id` を指定すれば、`graph.get_state(config)` や `graph.get_state_history(config)` でそのチケットのメッセージやツール使用状況を確認できる。
+Given a `thread_id`, `graph.get_state(config)` and `graph.get_state_history(config)` show the ticket's messages and tool usage.
 
 ---
 
-## 8. 入力の種類と期待される出力
+## 8. Input Types and Expected Outputs
 
-| 入力の種類 | 経路 | 期待される出力 | 03 ノートブック |
+| Input type | Path | Expected output | 03 notebook |
 |---|---|---|---|
-| 一般的な質問（記事あり） | Classifier → Knowledge | 記事に基づく回答。`resolved` | シナリオ 1 |
-| 一般的な質問（記事なし） | Classifier → Knowledge → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 5（ギフトカード） |
-| 記事がエスカレーションを指示している（二重請求など） | Classifier → Knowledge → Escalation | 記事の案内と引き継ぎ。`escalated` | シナリオ 3 |
-| ユーザー個別の照会・操作 | Classifier → Account ⇄ Tools | ツールの結果に基づく回答。`resolved` | シナリオ 2 |
-| ユーザー不明・ブロック済み | Classifier → Account → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 4（ブロック済み）、シナリオ 6（CultPass にいない） |
-| ツールのエラー | Classifier → Account ⇄ Tools → Escalation | 引き継ぎのメッセージ。`escalated` | — |
-| 明確に人を求める・苦情 | Classifier → Escalation | 引き継ぎのメッセージ。緊急度を記録して `escalated` | シナリオ 5（責任者と話したい） |
+| General question (article exists) | Classifier → Knowledge | Answer based on the article. `resolved` | Scenario 1 |
+| General question (no article) | Classifier → Knowledge → Escalation | Handoff message. `escalated` | Scenario 5 (gift cards) |
+| Article requires escalation (e.g., duplicate charges) | Classifier → Knowledge → Escalation | Article guidance plus handoff. `escalated` | Scenario 3 |
+| User-specific lookup or operation | Classifier → Account ⇄ Tools | Answer based on tool results. `resolved` | Scenario 2 |
+| User not found / blocked | Classifier → Account → Escalation | Handoff message. `escalated` | Scenario 4 (blocked), Scenario 6 (not in CultPass) |
+| Tool error | Classifier → Account ⇄ Tools → Escalation | Handoff message. `escalated` | — |
+| Explicit request for a human / complaint | Classifier → Escalation | Handoff message. Urgency recorded, `escalated` | Scenario 5 (wants to talk to a manager) |
 
 ---
 
-## 9. ログ
+## 9. Logging
 
-- Python の `logging` を使い、1行に1件の JSON を書く（JSON Lines）。出力先は `solution/logs/workflow.jsonl`（`agentic/logging_utils.py` の `log_event`）。
-- ログは `workflow.py` だけで書く。エージェントのコードには入れず、「エージェントを呼んでログを1行書く」小さな関数（`classifier_step` など）でノードを包む。
-- 記録するイベントは次のとおり。
+- Uses Python's `logging` to write one JSON object per line (JSON Lines) to `solution/logs/workflow.jsonl` (`log_event` in `agentic/logging_utils.py`).
+- Logs are written only in `workflow.py`. Agent code contains no logging; instead, each node is wrapped in a small function (e.g., `classifier_step`) that "calls the agent and writes one log line".
+- The following events are recorded:
 
-| node | event | 主な項目 |
+| node | event | Main fields |
 |---|---|---|
-| `load_memory` | `memory_loaded` | `user_id`、`past_tickets`（過去チケットの件数）、`error` |
-| `classifier` | `classified` | `category`、`urgency`、`reason` |
-| `knowledge` | `retrieved` | `top_article`、`confidence`、`escalation_reason` |
-| `account` | `account_step` | `tool_calls`（LLM が呼んだツール名）、`escalation_reason` |
-| `account_tools` | `tool_called` | `tool`、`ok`、`error`（ツールごとに1行） |
-| `escalation` | `escalated` | `reason`、`urgency` |
-| `save_memory` | `saved` | `status`、`resolution`、`errors`（DB の関数のエラー） |
+| `load_memory` | `memory_loaded` | `user_id`, `past_tickets` (number of past tickets), `error` |
+| `classifier` | `classified` | `category`, `urgency`, `reason` |
+| `knowledge` | `retrieved` | `top_article`, `confidence`, `escalation_reason` |
+| `account` | `account_step` | `tool_calls` (names of tools the LLM called), `escalation_reason` |
+| `account_tools` | `tool_called` | `tool`, `ok`, `error` (one line per tool) |
+| `escalation` | `escalated` | `reason`, `urgency` |
+| `save_memory` | `saved` | `status`, `resolution`, `errors` (errors from DB functions) |
 
 ```json
 {"ts": "2026-11-14T10:00:00", "ticket_id": "t-001", "node": "classifier", "event": "classified", "category": "knowledge", "urgency": "low", "reason": "..."}
 {"ts": "2026-11-14T10:00:01", "ticket_id": "t-001", "node": "knowledge", "event": "retrieved", "top_article": "QR Code Not Working at the Venue", "confidence": 0.643, "escalation_reason": null}
 ```
 
-`ticket_id` や `event` で検索、絞り込みができる。ノートブックでは `read_logs(ticket_id)` で1つのチケットの流れを確認できる。
+Logs can be searched and filtered by `ticket_id` or `event`. In the notebook, `read_logs(ticket_id)` shows the flow of a single ticket.
 
 ---
 
-## 10. テスト方針
+## 10. Testing Strategy
 
-| テスト | 確かめること | 場所 |
+| Test | What it checks | Location |
 |---|---|---|
-| ツールの単体テスト | 正常系、存在しないユーザー、ブロック済みのユーザー、他人の予約のキャンセル、キャンセル済みの予約、開始済みのイベント、24時間以内のキャンセル、引数の不足、DB ファイルがない、`@tool` ラッパーが本体と同じ結果を返す | `tests/test_cultpass_tools.py` |
-| ナレッジ検索 | 関係のある質問のスコアがしきい値以上で、関係のない質問はしきい値未満になる。スコアの高い順に並ぶ。空の質問や検索の失敗はエラーを返す | `tests/test_knowledge_search.py` |
-| 長期メモリ | チケットの作成、メッセージの保存（二重に保存しない）、status の更新、過去のチケットの取り出し（新しい順・件数の上限・ユーザーを混ぜない）、引き継ぎの要約が `past_context` に混ざらない | `tests/test_memory.py` |
-| ルーティング・エンドツーエンド | サンプルチケットごとに期待するエージェントへ振り分けられ、「解決」と「エスカレーション」の両方のシナリオが動く（第8章の表） | `03_agentic_app.ipynb` のシナリオ 1〜6 |
-| 短期メモリ | 同じ `thread_id` で会話が続く（シナリオ 2 の2回目の質問）。`get_state_history` でツールの呼び出しも確認できる | `03_agentic_app.ipynb` |
+| Tool unit tests | Normal cases, non-existent user, blocked user, cancelling another user's reservation, already-cancelled reservation, event already started, cancellation within 24 hours, missing arguments, missing DB file, `@tool` wrappers return the same result as the core functions | `tests/test_cultpass_tools.py` |
+| Knowledge search | Relevant questions score at or above the threshold and irrelevant ones below it. Results are sorted by score. Empty queries and search failures return errors | `tests/test_knowledge_search.py` |
+| Long-term memory | Creating tickets, saving messages (no duplicates), updating status, retrieving past tickets (newest first, count limit, no mixing of users), handoff summaries do not leak into `past_context` | `tests/test_memory.py` |
+| Routing / end-to-end | Each sample ticket is routed to the expected agent, and both "resolved" and "escalated" scenarios work (table in Section 8) | Scenarios 1–6 in `03_agentic_app.ipynb` |
+| Short-term memory | The conversation continues on the same `thread_id` (the second question in Scenario 2). Tool calls can also be checked with `get_state_history` | `03_agentic_app.ipynb` |
 
-- `tests/` は pytest で実行する（`solution/` から `pytest`）。ナレッジ検索の一部のテストは、埋め込みの API を呼ぶ。
-- ルーティングとエンドツーエンドは LLM の出力によって変わるので、自動テストにはせず、ノートブックで結果（`category`、`resolution`、ログ）を確認する。
+- `tests/` is run with pytest (`pytest` from `solution/`). Some knowledge search tests call the embedding API.
+- Routing and end-to-end behavior depend on LLM output, so they are not automated tests; instead, the results (`category`, `resolution`, logs) are checked in the notebook.
 
 ---
 
-## 11. ファイル構成
+## 11. File Structure
 
 ```text
 solution/agentic/
-├── design/architecture.md     # この設計書
-├── state.py                   # 共有する State（SupportState）
+├── design/
+│   ├── architecture.md        # this design document (English)
+│   └── architecture_ja.md     # design document (Japanese)
+├── state.py                   # shared State (SupportState)
 ├── agents/
-│   ├── llm.py                 # 4つのエージェントが共有する LLM（get_llm）
+│   ├── llm.py                 # LLM shared by the four agents (get_llm)
 │   ├── classifier.py
 │   ├── knowledge.py
-│   ├── account.py             # account ノードと account_tools ノード
+│   ├── account.py             # account node and account_tools node
 │   └── escalation.py
 ├── tools/
-│   ├── cultpass_tools.py      # CultPass DB ツール（本体 + @tool ラッパー）
-│   ├── knowledge_search.py    # RAG 検索（ChromaDB）
-│   └── memory.py              # 長期メモリの読み書き（udahub.db）
-├── logging_utils.py           # 構造化ログ
-└── workflow.py                # StateGraph の組み立て、orchestrator、new_ticket
+│   ├── cultpass_tools.py      # CultPass DB tools (core + @tool wrappers)
+│   ├── knowledge_search.py    # RAG search (ChromaDB)
+│   └── memory.py              # long-term memory read/write (udahub.db)
+├── logging_utils.py           # structured logging
+└── workflow.py                # StateGraph assembly, orchestrator, new_ticket
 
-solution/tests/                # pytest（ツール、ナレッジ検索、長期メモリ）
+solution/tests/                # pytest (tools, knowledge search, long-term memory)
 
 solution/data/
-├── external/cultpass.db       # CultPass の DB（01 ノートブックで作成）
+├── external/cultpass.db       # CultPass DB (created in notebook 01)
 └── core/
-    ├── udahub.db              # UDA-Hub の DB（02 ノートブックで作成）
-    └── chroma/                # ChromaDB の永続化ディレクトリ（自動生成）
+    ├── udahub.db              # UDA-Hub DB (created in notebook 02)
+    └── chroma/                # ChromaDB persistence directory (auto-generated)
 
-solution/logs/workflow.jsonl   # ログ（自動生成）
+solution/logs/workflow.jsonl   # logs (auto-generated)
 ```
 
-`State` を `workflow.py` ではなく `state.py` に置くのは、エージェントと `workflow.py` の両方が import するためである（`workflow.py` に置くと循環 import になる）。
+`State` lives in `state.py` rather than `workflow.py` because both the agents and `workflow.py` import it (putting it in `workflow.py` would cause a circular import).
 
-MCP に移行する場合は、`tools/mcp_server.py` を追加して、`cultpass_tools.py` の本体関数を MCP ツールとして公開する。
+To move to MCP, add `tools/mcp_server.py` and expose the core functions in `cultpass_tools.py` as MCP tools.
