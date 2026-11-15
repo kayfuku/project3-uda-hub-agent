@@ -11,7 +11,7 @@ The first customer is **CultPass**, a fictional subscription service for cultura
 
 ```mermaid
 flowchart TD
-    START([Ticket received]) --> LOAD[load_memory<br/>Load ticket info and past interactions]
+    START([Ticket received]) --> LOAD[load_memory<br/>Load ticket info, past interactions<br/>and customer preferences]
     LOAD --> CLS[Classifier Agent<br/>Category and urgency]
 
     CLS -->|knowledge| KNOW[Knowledge Agent<br/>Search articles with RAG → answer]
@@ -27,7 +27,7 @@ flowchart TD
     ACC -->|final answer| SAVE
     ACC -->|user not found / blocked| ESC
 
-    ESC --> SAVE[save_memory<br/>Save conversation and outcome to the DB]
+    ESC --> SAVE[save_memory<br/>Save conversation, outcome<br/>and new preferences to the DB]
     SAVE --> END([Return the answer])
 ```
 
@@ -48,7 +48,7 @@ flowchart TD
 
 | Agent                     | Role                                                                                                                                          |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Classifier** (supervisor) | Decides the category (`knowledge` / `account` / `escalation`) and the urgency from the ticket content and metadata                          |
+| **Classifier** (supervisor) | Decides the category (`knowledge` / `account` / `escalation`) and the urgency from the ticket content and metadata. Also picks up preferences the customer clearly states |
 | **Knowledge**             | Searches knowledge articles with vector search (RAG) and answers only from what the articles say. Escalates when confidence is below the threshold (0.30) |
 | **Account**               | Answers with CultPass DB tools (look up the profile, subscription, and reservations, and cancel a reservation)                               |
 | **Escalation**            | Writes a message for the customer and a handoff summary for the human agent                                                                   |
@@ -90,7 +90,7 @@ sqlalchemy, python-dotenv, pytest, and others
    | Notebook                     | What it creates                                                                                                                      |
    | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
    | `01_external_db_setup.ipynb` | `data/external/cultpass.db` (CultPass side: users, subscriptions, experiences, reservations)                                         |
-   | `02_core_db_setup.ipynb`     | `data/core/udahub.db` (UDA-Hub core: accounts, users, tickets, ticket_metadata, ticket_messages, knowledge, including 14 articles) |
+   | `02_core_db_setup.ipynb`     | `data/core/udahub.db` (UDA-Hub core: accounts, users, tickets, ticket_metadata, ticket_messages, customer_preferences, knowledge, including 14 articles) |
 
    The ChromaDB store for knowledge search (`data/core/chroma/`) is built automatically from the articles in udahub.db the first time a search runs.
 
@@ -99,8 +99,8 @@ sqlalchemy, python-dotenv, pytest, and others
 In `solution/`, run `03_agentic_app.ipynb` from top to bottom. It:
 
 - Shows a diagram of the graph.
-- Runs six scenarios with sample tickets (see the table below).
-- Shows the State history (per `thread_id`), the conversations saved in the DB, and the logs.
+- Runs seven scenarios with sample tickets (see the table below).
+- Shows the State history (per `thread_id`), the conversations and customer preferences saved in the DB, and the logs.
 - Offers an interactive mode with `chat_interface()` in the last cell (type `q` to quit).
 
 | Scenario | Ticket                                                                                 | Expected flow                                                         |
@@ -111,6 +111,7 @@ In `solution/`, run `03_agentic_app.ipynb` from top to bottom. It:
 | 4        | Reservation cancellation by a blocked user                                             | account → escalated                                                   |
 | 5        | Gift card / asking for a manager in Japanese                                           | knowledge → escalated / escalation → escalated                        |
 | 6        | A user who is not registered with CultPass                                             | account → escalated (`User not found`)                                |
+| 7        | "Please always reply in Japanese…" → a new ticket with an English question             | account → resolved, then knowledge → resolved in Japanese (customer preferences; long-term memory) |
 
 Notes:
 
@@ -130,13 +131,13 @@ Run this in `solution/`:
 
 ### Break Down Tests
 
-There are 49 tests in total.
+There are 55 tests in total.
 
 | File                             | Tests | What they check                                                                                                                                                                                                                                                                                  |
 | -------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tests/test_cultpass_tools.py`   | 20    | CultPass DB tools: looking up users, subscriptions, and reservation lists, and cancelling reservations (the 24-hour rule, already cancelled, someone else's reservation, blocked users, events that have already started). When the DB is missing or an argument is missing, the tools return `{"ok": False, "error": ...}` instead of raising an exception |
 | `tests/test_knowledge_search.py` | 9     | Knowledge search: errors for empty questions and failed searches, loading articles, and the tool wrapper. Related questions score at or above the confidence threshold, unrelated questions score below it, and articles are sorted by score                                                      |
-| `tests/test_memory.py`           | 20    | Long-term memory (udahub.db): creating tickets, saving conversations (without saving twice), updating the status, getting past interactions (newest first, limited count, never mixed with other users), and saving handoff summaries                                                            |
+| `tests/test_memory.py`           | 26    | Long-term memory (udahub.db): creating tickets, saving conversations (without saving twice), updating the status, getting past interactions (newest first, limited count, never mixed with other users), saving handoff summaries, and customer preferences (kept across tickets, only the given keys overwritten, unknown keys and empty values skipped, never mixed with other users) |
 
 Examples:
 
@@ -144,6 +145,7 @@ Examples:
 tests/test_cultpass_tools.py::test_cancel_other_users_reservation        … cannot cancel someone else's reservation
 tests/test_knowledge_search.py::test_unrelated_question_is_not_confident … an unrelated question gets low confidence
 tests/test_memory.py::test_past_context_does_not_mix_users               … never mixes in another user's history
+tests/test_memory.py::test_preferences_are_kept_across_tickets           … preferences saved in one ticket are loaded in a later one
 ```
 
 The end-to-end flow (classify → route → answer / escalate → save) is checked with the scenarios in `03_agentic_app.ipynb`.
@@ -184,7 +186,7 @@ Where each rubric item is covered:
 | RAG and confidence-based escalation                   | `agentic/tools/knowledge_search.py`, the Knowledge agent         |
 | CultPass DB tools (2+, with error handling)           | `agentic/tools/cultpass_tools.py` (4 tools)                      |
 | Short-term memory                                     | LangGraph `MemorySaver` with `thread_id` (= `ticket_id`)         |
-| Long-term memory                                      | Past tickets in udahub.db (`agentic/tools/memory.py`)            |
+| Long-term memory                                      | Past tickets and customer preferences in udahub.db (`agentic/tools/memory.py`) |
 | Structured, searchable logs                           | `agentic/logging_utils.py`, `logs/workflow.jsonl`                |
 | Test cases                                            | `tests/`                                                         |
 
@@ -193,6 +195,7 @@ Where each rubric item is covered:
 - **Supervisor pattern**: The Classifier acts as the coordinator and routes each ticket to a specialized agent.
 - **Confidence**: `1 − cosine distance of the top search result`. The threshold is 0.30, based on measured scores (related questions: 0.312–0.659; unrelated questions: 0.136–0.253).
 - **Two-layer tools**: The core of each tool is a function that returns a dict. It never raises an exception and returns either `{"ok": True, "data": ...}` or `{"ok": False, "error": ...}`. An `@tool` wrapper on top exposes it to the LLM.
+- **Customer preferences**: The Classifier picks up preferences the customer clearly states (`language`, `interests`, `others`) in the same LLM call, and `save_memory` saves them to the `customer_preferences` table. In later tickets, `load_memory` loads them, and one shared rule (`PREFERENCE_RULES` in `agentic/agents/llm.py`) at the top of the Knowledge, Account, and Escalation prompts says that preferences take priority over the default style rules. The rule does not depend on the kind of preference, so a new key needs no change in the agents.
 - **Safety measures**: Before the Account agent's tools run, `user_id` is overwritten with the value from the State, so the agent cannot touch another user's data. The profile tool does not return names or email addresses. A reservation is cancelled only after the customer confirms.
 
 ## License

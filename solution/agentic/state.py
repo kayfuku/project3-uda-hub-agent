@@ -12,6 +12,8 @@ class SupportState(MessagesState):
     user_id: str                      # User ID on the CultPass side
     ticket_metadata: dict             # channel, main_issue_type, tags, etc.
     past_context: str                 # Summary of past interactions (long-term memory)
+    customer_preferences: dict        # Saved preferences + ones stated this turn (long-term memory)
+    new_preferences: dict             # Preferences stated this turn (save_memory saves them)
     category: str                     # Classifier result (knowledge / account / escalation)
     urgency: str                      # low / medium / high
     classification_reason: str        # Classifier's reasoning

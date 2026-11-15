@@ -13,15 +13,22 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from agentic.agents.classifier import _latest_user_message
-from agentic.agents.llm import get_llm
+from agentic.agents.llm import get_llm, preference_rules
 from agentic.state import SupportState
 from agentic.tools.knowledge_search import CONFIDENCE_THRESHOLD, search_knowledge
 
 
 class KnowledgeAnswer(BaseModel):
-    """LLM output of the Knowledge Agent."""
+    """LLM output of the Knowledge Agent.
+
+    applied_preferences is answered first, so the preferences to follow are written down before the answer
+    (without it, the agent sometimes replied in English although the customer prefers Japanese).
+    """
+    applied_preferences: str = Field(
+        description="The customer preferences this reply must follow, copied from 'Customer preferences'. "
+                    "'None' if there are none.")
     answer: str = Field(
-        description="The reply to the customer, based only on the articles.")
+        description="The reply to the customer, based only on the articles and following applied_preferences.")
     used_article_titles: list[str] = Field(
         description="Titles of the articles the answer is based on.")
     needs_escalation: bool = Field(
@@ -35,7 +42,12 @@ SYSTEM_PROMPT = """\
 You are the knowledge agent of UDA-Hub, answering CultPass customers.
 Answer ONLY with information from the help-center articles below. Do not invent policies, prices or steps.
 
-- Reply in the same language as the customer, in a short and friendly way.
+{preference_rules}
+Default style rules:
+- Reply in a short and friendly way.
+- If no preference says otherwise, reply in the same language as the customer.
+
+Rules:
 - Some articles say a case must be escalated to a human (for example duplicate charges or refund exceptions).
   Set needs_escalation to true ONLY if what the customer has already told you meets that escalation condition.
   In that case, give the guidance from the article and tell them a support agent will follow up.
@@ -93,7 +105,8 @@ def knowledge_node(state: SupportState) -> dict:
     )
     llm = get_llm().with_structured_output(KnowledgeAnswer)
     answer = llm.invoke([
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=SYSTEM_PROMPT.format(
+            preference_rules=preference_rules(state.get("customer_preferences", {})))),
         HumanMessage(content=user_prompt),
     ])
 

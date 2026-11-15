@@ -30,7 +30,9 @@ def db(tmp_path, monkeypatch):
     test_db = tmp_path / "udahub.db"
     shutil.copy(memory.UDAHUB_DB_PATH, test_db)
 
-    TestSession = sessionmaker(bind=create_engine(f"sqlite:///{test_db}"))
+    test_engine = create_engine(f"sqlite:///{test_db}")
+    udahub.Base.metadata.create_all(test_engine)  # add tables missing from an older DB (e.g. customer_preferences)
+    TestSession = sessionmaker(bind=test_engine)
     monkeypatch.setattr(memory, "UDAHUB_DB_PATH", test_db)
     monkeypatch.setattr(memory, "Session", TestSession)
     return TestSession
@@ -251,3 +253,54 @@ def test_save_handoff_summary_rejects_empty_summary(db):
 def test_save_handoff_summary_unknown_ticket(db):
     result = memory.save_handoff_summary("no-such-ticket", "summary")
     assert result == {"ok": False, "error": "Ticket not found: no-such-ticket"}
+
+
+# ---------------------------------------------------------------
+# save_preferences / load_preferences
+# ---------------------------------------------------------------
+def test_new_customer_has_no_preferences(db):
+    assert memory.load_preferences("never-seen-user") == {"ok": True, "data": {}}
+
+
+def test_preferences_are_kept_across_tickets(db):
+    """Preferences saved in one ticket can be loaded in a later ticket of the same user."""
+    memory.create_ticket(USER)
+    memory.save_preferences(USER, {"language": "Japanese", "interests": "jazz concerts"})
+    memory.create_ticket(USER)  # a new session
+
+    result = memory.load_preferences(USER)
+
+    assert result["data"] == {"language": "Japanese", "interests": "jazz concerts"}
+
+
+def test_save_preferences_overwrites_only_given_keys(db):
+    memory.create_ticket(USER)
+    memory.save_preferences(USER, {"language": "Japanese", "others": "Keep replies short"})
+
+    result = memory.save_preferences(USER, {"language": "English"})
+
+    assert result["data"]["saved"] == ["language"]
+    assert memory.load_preferences(USER)["data"] == {
+        "language": "English", "others": "Keep replies short"}
+
+
+def test_save_preferences_skips_unknown_keys_and_empty_values(db):
+    memory.create_ticket(USER)
+
+    result = memory.save_preferences(USER, {"language": "  ", "interests": None,
+                                            "phone": "090-0000-0000"})
+
+    assert result == {"ok": True, "data": {"saved": []}}
+    assert memory.load_preferences(USER)["data"] == {}
+
+
+def test_preferences_do_not_mix_users(db):
+    memory.create_ticket("other-user")
+    memory.save_preferences("other-user", {"language": "Japanese"})
+
+    assert memory.load_preferences(USER)["data"] == {}
+
+
+def test_save_preferences_unknown_user(db):
+    result = memory.save_preferences("no-such-user", {"language": "Japanese"})
+    assert result == {"ok": False, "error": "User not found: no-such-user"}

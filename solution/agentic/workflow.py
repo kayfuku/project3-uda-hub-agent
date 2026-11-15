@@ -28,8 +28,10 @@ from agentic.tools.memory import (
     create_ticket,
     get_ticket_info,
     load_past_context,
+    load_preferences,
     save_handoff_summary,
     save_messages,
+    save_preferences,
     update_ticket_status,
 )
 
@@ -43,6 +45,7 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
     - chat_interface only passes messages, so we look up the ticket in udahub.db
       by thread_id (= ticket_id) to get user_id and ticket_metadata.
     - Past tickets of the same user become past_context (long-term memory).
+    - The user's saved preferences become customer_preferences (long-term memory).
     - MemorySaver keeps the whole State, so without a reset, leftovers such as
       the previous turn's escalation_reason would send us to the wrong node.
     Do not stop if a DB function returns an error (if user_id is empty, Account will escalate).
@@ -50,6 +53,8 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
     ticket_id = config["configurable"]["thread_id"]
 
     user_id, ticket_metadata, past_context, past_tickets = "", {}, "", 0
+    preferences = {}
+    errors = []
     info = get_ticket_info(ticket_id)
     if info["ok"]:
         data = info["data"]
@@ -60,16 +65,24 @@ def load_memory_node(state: SupportState, config: RunnableConfig) -> dict:
         if past["ok"]:
             past_context = past["data"]["summary"]
             past_tickets = len(past["data"]["tickets"])
+        prefs = load_preferences(user_id)
+        if prefs["ok"]:
+            preferences = prefs["data"]
+        errors = [r["error"] for r in (past, prefs) if not r["ok"]]
+    else:
+        errors = [info["error"]]
 
     log_event(ticket_id, "load_memory", "memory_loaded", user_id=user_id,
-              past_tickets=past_tickets, error=None if info["ok"] else info["error"])
+              past_tickets=past_tickets, preferences=sorted(preferences), errors=errors)
 
     return {
         "ticket_id": ticket_id,
         "user_id": user_id,
         "ticket_metadata": ticket_metadata,
         "past_context": past_context,
+        "customer_preferences": preferences,
         # Reset the previous turn's results below
+        "new_preferences": {},
         "category": "",
         "urgency": "",
         "classification_reason": "",
@@ -95,6 +108,11 @@ def save_memory_node(state: SupportState) -> dict:
     # Already-saved messages are skipped by message.id, so it is fine to pass all of them every turn
     results.append(save_messages(ticket_id, state["messages"]))
 
+    # Preferences the customer stated this turn (used in later tickets as well)
+    new_preferences = state.get("new_preferences") or {}
+    if new_preferences and state.get("user_id"):
+        results.append(save_preferences(state["user_id"], new_preferences))
+
     if state.get("resolution") == "escalated" and state.get("handoff_summary"):
         results.append(save_handoff_summary(
             ticket_id, state["handoff_summary"]))
@@ -113,7 +131,8 @@ def save_memory_node(state: SupportState) -> dict:
 
     errors = [r["error"] for r in results if not r["ok"]]
     log_event(ticket_id, "save_memory", "saved", status=status,
-              resolution=state.get("resolution"), errors=errors)
+              resolution=state.get("resolution"),
+              preferences_saved=sorted(new_preferences), errors=errors)
     return {}
 
 
@@ -124,7 +143,8 @@ def classifier_step(state: SupportState) -> dict:
     update = classifier_node(state)
     log_event(state["ticket_id"], "classifier", "classified",
               category=update["category"], urgency=update["urgency"],
-              reason=update["classification_reason"])
+              reason=update["classification_reason"],
+              stated_preferences=sorted(update["new_preferences"]))
     return update
 
 

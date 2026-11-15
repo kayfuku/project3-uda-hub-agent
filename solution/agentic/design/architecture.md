@@ -23,7 +23,7 @@ The first customer is **CultPass** (a subscription service for cultural experien
 
 ```mermaid
 flowchart TD
-    START([Ticket received]) --> LOAD[load_memory<br/>Fetch ticket info and past interactions]
+    START([Ticket received]) --> LOAD[load_memory<br/>Fetch ticket info, past interactions<br/>and customer preferences]
     LOAD --> CLS[Classifier Agent<br/>Classify and assess urgency]
 
     CLS -->|knowledge| KNOW[Knowledge Agent<br/>Search articles with RAG → answer]
@@ -39,7 +39,7 @@ flowchart TD
     ACC -->|final answer| SAVE
     ACC -->|user not found / blocked| ESC
 
-    ESC --> SAVE[save_memory<br/>Save conversation and outcome to DB]
+    ESC --> SAVE[save_memory<br/>Save conversation, outcome<br/>and new preferences to DB]
     SAVE --> END([Return the answer])
 ```
 
@@ -56,12 +56,14 @@ flowchart TD
 
 | Item | Details |
 |---|---|
-| Responsibility | Decide the destination and urgency from the ticket content and metadata |
-| Input | Latest user message, recent conversation (user and AI message text, up to 6), ticket metadata (`channel`, `main_issue_type`, `tags`, `created_at`), summary of past interactions (`past_context`) |
-| Output | `category` (`knowledge` / `account` / `escalation`), `urgency` (`low` / `medium` / `high`), `reason` (the rationale; stored in the State as `classification_reason`) |
+| Responsibility | Decide the destination and urgency from the ticket content and metadata. Also pick up preferences the customer clearly states |
+| Input | Latest user message, recent conversation (user and AI message text, up to 6), ticket metadata (`channel`, `main_issue_type`, `tags`, `created_at`), summary of past interactions (`past_context`), saved customer preferences (`customer_preferences`) |
+| Output | `category` (`knowledge` / `account` / `escalation`), `urgency` (`low` / `medium` / `high`), `reason` (the rationale; stored in the State as `classification_reason`), `stated_preferences` (stored in the State as `new_preferences`) |
 | Method | LLM structured output (Pydantic model `Classification`) |
 
 The recent conversation is passed so that short replies such as "Yes, please cancel it" are routed to the same destination as the preceding question.
+
+Preferences are extracted in the same LLM call, so no extra call is needed (Section 7.1). Only preferences the customer clearly states are extracted; writing in a language is not treated as a preference, but "Please always reply in Japanese" is. The new preferences are also merged into `customer_preferences` right away, so they apply from the same turn.
 
 Classification criteria:
 
@@ -84,7 +86,7 @@ Urgency criteria:
 | Item | Details |
 |---|---|
 | Responsibility | Search knowledge articles and answer **based only on the article content** |
-| Input | Latest user message, `past_context` |
+| Input | Latest user message, `past_context`, `customer_preferences` |
 | Output | Answer text (`AIMessage`), `retrieved_articles` (titles and scores of the retrieved articles), `confidence` |
 | Method | RAG (Section 5). ① Call `search_knowledge` directly in code (not as an LLM tool call). ② If confidence is below the threshold, escalate without calling the LLM. ③ Otherwise, pass the top 3 articles to the LLM and have it answer with structured output (`KnowledgeAnswer`). The LLM is instructed not to answer anything that is not in the articles |
 | Escalation conditions | The search failed. `confidence` is below the threshold. The LLM returned `needs_escalation = True` (the article itself requires escalation and the user's situation meets that condition, or the articles contain no answer) |
@@ -97,7 +99,7 @@ Urgency criteria:
 | Item | Details |
 |---|---|
 | Responsibility | Query and operate on the CultPass DB through tools to handle user-specific requests |
-| Input | The full conversation (`messages`), the CultPass `user_id` of the ticket's user |
+| Input | The full conversation (`messages`), the CultPass `user_id` of the ticket's user, `customer_preferences` |
 | Output | An answer based on the tool results |
 | Method | ① Call `get_user_profile(user_id)` directly in code to check that the user exists and is not blocked (this is not left to the LLM). ② Give the tools to the LLM (`bind_tools`) and call them in an `account ⇄ account_tools` loop, built explicitly in the graph. ③ `account_tools` overwrites the `user_id` given by the LLM with the value from the State before running the tool (so it cannot operate on another user's data) |
 | Escalation conditions | User not found, or the account is blocked (`is_blocked`) — checked in the `account` node. A tool returned an error (`ok: False`) — checked in the `account_tools` node |
@@ -110,8 +112,8 @@ Urgency criteria:
 | Item | Details |
 |---|---|
 | Responsibility | Hand off to a human agent, leaving a summary so they can act quickly |
-| Input | The full conversation, the escalation reason (`escalation_reason`; `classification_reason` when coming directly from the Classifier), urgency, `past_context`, any guidance already given earlier in this turn |
-| Output | A message for the user (in the user's language: "A support agent will follow up"), a summary for the human agent (`handoff_summary`, in English) |
+| Input | The full conversation, the escalation reason (`escalation_reason`; `classification_reason` when coming directly from the Classifier), urgency, `past_context`, `customer_preferences`, any guidance already given earlier in this turn |
+| Output | A message for the user (in the preferred language, or the user's language if none is saved: "A support agent will follow up"), a summary for the human agent (`handoff_summary`, in English; includes preferences that matter for the follow-up, such as the contact method) |
 | Method | LLM structured output (`EscalationOutput`). The model answers `customer_language` first, so the reply language is decided up front |
 | Side effects | None. DB writes (setting `status` to `escalated`, saving the summary, recording urgency as a tag) are done by `save_memory` (Section 7) |
 
@@ -134,6 +136,8 @@ class SupportState(MessagesState):
     user_id: str                      # CultPass user ID
     ticket_metadata: dict             # channel, main_issue_type, tags, etc.
     past_context: str                 # summary of past interactions (long-term memory)
+    customer_preferences: dict        # saved preferences + ones stated this turn (long-term memory)
+    new_preferences: dict             # preferences stated this turn (save_memory saves them)
     category: str                     # Classifier result (knowledge / account / escalation)
     urgency: str                      # low / medium / high
     classification_reason: str        # Classifier's rationale
@@ -144,19 +148,20 @@ class SupportState(MessagesState):
     resolution: str                   # resolved / escalated
 ```
 
-- Only `messages` and `thread_id` (= `ticket_id`) are passed to the graph. `load_memory` looks up udahub.db by `ticket_id` and puts `user_id` and `ticket_metadata` into the State.
-- `MemorySaver` keeps the entire State, so `load_memory` resets the per-turn results (`category` through `resolution`) at the start of each turn. Without the reset, the previous turn's `escalation_reason` would remain and send the ticket to the wrong destination.
+- Only `messages` and `thread_id` (= `ticket_id`) are passed to the graph. `load_memory` looks up udahub.db by `ticket_id` and puts `user_id`, `ticket_metadata`, `past_context` and `customer_preferences` into the State.
+- `MemorySaver` keeps the entire State, so `load_memory` resets the per-turn results (`new_preferences`, and `category` through `resolution`) at the start of each turn. Without the reset, the previous turn's `escalation_reason` would remain and send the ticket to the wrong destination.
 
 As a concrete example, here is how the ticket "I want to cancel my reservation for next week" is processed, step by step:
 
 ```
 ① load_memory      Get user_id from ticket_id. past_context = "- 2026-11-10 [resolved] ...: "The QR code won't scan..." → ..."
-② classifier       category = "account", urgency = "medium"
+                   customer_preferences = {"language": "Japanese"}
+② classifier       category = "account", urgency = "medium", new_preferences = {} (no new preference stated)
 ③ account          Check get_user_profile(user_id) in code → OK. The LLM calls get_reservations(user_id)
 ④ account_tools    → {"ok": true, "data": [{"reservation_id": "r1", ...}]}
 ⑤ account          The LLM calls cancel_reservation(user_id, "r1")
 ⑥ account_tools    → {"ok": true, "data": {"status": "cancelled", "within_24h": false, ...}}
-⑦ account          Answer: "Your reservation has been cancelled. Your credit will be returned."  resolution = "resolved"
+⑦ account          Answer in Japanese (the saved preference): "ご予約をキャンセルしました。クレジットは返却されます。"  resolution = "resolved"
 ⑧ save_memory      Save the conversation to ticket_messages; set status = "resolved", main_issue_type = "account", tags = "urgency:medium"
 ```
 
@@ -271,7 +276,8 @@ flowchart LR
 | Type | Scope | Storage | Contents | Usage |
 |---|---|---|---|---|
 | Short-term memory | `thread_id` (= `ticket_id`) | LangGraph `MemorySaver` | Conversation within the same ticket, tool calls and their results, State | Context when continuing the conversation on the same ticket |
-| Long-term memory | User (`user_id`) | udahub.db (`ticket_messages`, `ticket_metadata`) | Conversations from past tickets, resolved/escalated outcomes, handoff summaries | `load_memory` retrieves the same user's past tickets and passes them as `past_context` to the Classifier, Knowledge, and Escalation agents |
+| Long-term memory (past tickets) | User (`user_id`) | udahub.db (`ticket_messages`, `ticket_metadata`) | Conversations from past tickets, resolved/escalated outcomes, handoff summaries | `load_memory` retrieves the same user's past tickets and passes them as `past_context` to the Classifier, Knowledge, and Escalation agents |
+| Long-term memory (customer preferences) | User (`user_id`) | udahub.db (`customer_preferences`) | Preferences the customer stated: `language`, `interests`, `others` | `load_memory` loads them as `customer_preferences`. The Knowledge, Account, and Escalation agents follow them when replying (Section 7.1) |
 
 Long-term memory is read and written by the functions in `agentic/tools/memory.py`. They are called by graph nodes (`load_memory` / `save_memory`), not by the LLM as tools, so no `@tool` wrappers are created.
 
@@ -284,6 +290,7 @@ Long-term memory is read and written by the functions in `agentic/tools/memory.p
 
 - Looks up the ticket from `thread_id` and puts the CultPass `user_id` and `ticket_metadata` into the State.
 - Retrieves up to 3 of the same user's past tickets (excluding the current one), newest first, and summarizes each as a short line with the date, outcome, category, the first user message, and the last AI message (up to 150 characters each) into `past_context`. For a first-time user it is "No past tickets from this customer."
+- Loads the user's saved preferences into `customer_preferences` (`{}` for a first-time user).
 - The graph does not stop even if a DB function returns an error (if `user_id` is empty, the Account Agent escalates).
 
 **Saving (`save_memory`)** — this is the only node that writes to udahub.db (agents do not write).
@@ -292,10 +299,41 @@ Long-term memory is read and written by the functions in `agentic/tools/memory.p
 - When escalated, `handoff_summary` is saved to `ticket_messages` with `role = system` (`[Handoff] ...`). Because `past_context` uses only user and AI messages, the summary does not leak into it.
 - Overwrites `status` in `ticket_metadata` with the turn's outcome (`resolved` / `escalated`, or `open` if there is no outcome). However, once a ticket becomes `escalated`, it stays `escalated` (so that a ticket waiting for a human is not hidden by a `resolved` in a later turn).
 - Records the Classifier's `category` in `main_issue_type`, and `urgency:<urgency>` in `tags`.
+- Saves the preferences stated this turn (`new_preferences`) to `customer_preferences`.
 
 **Example**: When a user whose previous ticket "The QR code won't scan" was resolved comes back, that ticket is included in `past_context`, so the agent can respond with context, e.g., "You also contacted us about a QR code issue last time."
 
 Given a `thread_id`, `graph.get_state(config)` and `graph.get_state_history(config)` show the ticket's messages and tool usage.
+
+### 7.1 Customer Preferences
+
+Past tickets alone do not tell the agents how a customer wants to be served, so preferences are kept in their own table.
+
+```text
+Ticket A (session 1)
+  Customer: "Please always reply in Japanese from now on. I love jazz concerts. Is my subscription still active?"
+    classifier   new_preferences = {"language": "Japanese", "interests": "jazz concerts"}
+    account      replies in Japanese (the preference applies from this turn)
+    save_memory  saves them to customer_preferences
+
+Ticket B (session 2: a new thread_id, so short-term memory is empty)
+  load_memory    customer_preferences = {"language": "Japanese", "interests": "jazz concerts"}
+  Customer: "The QR code won't scan"  (in English)
+    knowledge    replies in Japanese, following the saved preference
+```
+
+**Table `customer_preferences`** (`data/models/udahub.py`): one row per (user, key). The primary key is (`user_id`, `pref_key`).
+
+| `pref_key` | Contents | Example |
+|---|---|---|
+| `language` | Language the customer wants replies in | `Japanese` |
+| `interests` | Kinds of experiences the customer likes | `jazz concerts, museums` |
+| `others` | Any other lasting preference | `Prefers short replies`, `Prefers to be contacted by email` |
+
+- **Extraction**: the Classifier returns `stated_preferences` in its structured output. Contact details such as email addresses or phone numbers are never stored. When `interests` or `others` already has a value, the Classifier returns the saved content together with the new one.
+- **Saving**: `save_preferences` (called from `save_memory`) overwrites only the given keys and keeps the others. Unknown keys and empty values are skipped.
+- **Usage**: `PREFERENCE_RULES` in `agentic/agents/llm.py` is placed at the top of the system prompts of the Knowledge, Account, and Escalation agents. It says that the customer's preferences take priority over the default style rules (such as "reply in the same language as the customer"). The rules do not depend on the kind of preference, so adding a new key does not require changing the agents.
+- **Making it reliable**: the Knowledge Agent's structured output (`KnowledgeAnswer`) starts with `applied_preferences`, where the model copies the preferences it must follow before writing the answer (without it, it sometimes replied in English to a customer who prefers Japanese). The Escalation Agent's `handoff_summary` mentions only the saved preferences, never guessed ones.
 
 ---
 
@@ -310,6 +348,7 @@ Given a `thread_id`, `graph.get_state(config)` and `graph.get_state_history(conf
 | User not found / blocked | Classifier → Account → Escalation | Handoff message. `escalated` | Scenario 4 (blocked), Scenario 6 (not in CultPass) |
 | Tool error | Classifier → Account ⇄ Tools → Escalation | Handoff message. `escalated` | — |
 | Explicit request for a human / complaint | Classifier → Escalation | Handoff message. Urgency recorded, `escalated` | Scenario 5 (wants to talk to a manager) |
+| Customer states a preference, then comes back in a new session | Classifier → Account, then (new ticket) Classifier → Knowledge | The preference is saved, and the next ticket's reply follows it. `resolved` | Scenario 7 |
 
 ---
 
@@ -321,13 +360,13 @@ Given a `thread_id`, `graph.get_state(config)` and `graph.get_state_history(conf
 
 | node | event | Main fields |
 |---|---|---|
-| `load_memory` | `memory_loaded` | `user_id`, `past_tickets` (number of past tickets), `error` |
-| `classifier` | `classified` | `category`, `urgency`, `reason` |
+| `load_memory` | `memory_loaded` | `user_id`, `past_tickets` (number of past tickets), `preferences` (keys of the saved preferences), `errors` |
+| `classifier` | `classified` | `category`, `urgency`, `reason`, `stated_preferences` (keys of the preferences stated this turn) |
 | `knowledge` | `retrieved` | `top_article`, `confidence`, `escalation_reason` |
 | `account` | `account_step` | `tool_calls` (names of tools the LLM called), `escalation_reason` |
 | `account_tools` | `tool_called` | `tool`, `ok`, `error` (one line per tool) |
 | `escalation` | `escalated` | `reason`, `urgency` |
-| `save_memory` | `saved` | `status`, `resolution`, `errors` (errors from DB functions) |
+| `save_memory` | `saved` | `status`, `resolution`, `preferences_saved` (keys of the saved preferences), `errors` (errors from DB functions) |
 
 ```json
 {"ts": "2026-11-14T10:00:00", "ticket_id": "t-001", "node": "classifier", "event": "classified", "category": "knowledge", "urgency": "low", "reason": "..."}
@@ -344,8 +383,9 @@ Logs can be searched and filtered by `ticket_id` or `event`. In the notebook, `r
 |---|---|---|
 | Tool unit tests | Normal cases, non-existent user, blocked user, cancelling another user's reservation, already-cancelled reservation, event already started, cancellation within 24 hours, missing arguments, missing DB file, `@tool` wrappers return the same result as the core functions | `tests/test_cultpass_tools.py` |
 | Knowledge search | Relevant questions score at or above the threshold and irrelevant ones below it. Results are sorted by score. Empty queries and search failures return errors | `tests/test_knowledge_search.py` |
-| Long-term memory | Creating tickets, saving messages (no duplicates), updating status, retrieving past tickets (newest first, count limit, no mixing of users), handoff summaries do not leak into `past_context` | `tests/test_memory.py` |
-| Routing / end-to-end | Each sample ticket is routed to the expected agent, and both "resolved" and "escalated" scenarios work (table in Section 8) | Scenarios 1–6 in `03_agentic_app.ipynb` |
+| Long-term memory | Creating tickets, saving messages (no duplicates), updating status, retrieving past tickets (newest first, count limit, no mixing of users), handoff summaries do not leak into `past_context`, customer preferences (kept across tickets, only given keys overwritten, unknown keys and empty values skipped, no mixing of users) | `tests/test_memory.py` |
+| Routing / end-to-end | Each sample ticket is routed to the expected agent, and both "resolved" and "escalated" scenarios work (table in Section 8) | Scenarios 1–7 in `03_agentic_app.ipynb` |
+| Customer preferences across sessions | A preference stated in one ticket is loaded in a new ticket and the reply follows it | Scenario 7 in `03_agentic_app.ipynb` |
 | Short-term memory | The conversation continues on the same `thread_id` (the second question in Scenario 2). Tool calls can also be checked with `get_state_history` | `03_agentic_app.ipynb` |
 
 - `tests/` is run with pytest (`pytest` from `solution/`). Some knowledge search tests call the embedding API.
@@ -362,7 +402,7 @@ solution/agentic/
 │   └── architecture_ja.md     # design document (Japanese)
 ├── state.py                   # shared State (SupportState)
 ├── agents/
-│   ├── llm.py                 # LLM shared by the four agents (get_llm)
+│   ├── llm.py                 # LLM shared by the four agents (get_llm), shared preference rules (PREFERENCE_RULES)
 │   ├── classifier.py
 │   ├── knowledge.py
 │   ├── account.py             # account node and account_tools node
@@ -370,7 +410,7 @@ solution/agentic/
 ├── tools/
 │   ├── cultpass_tools.py      # CultPass DB tools (core + @tool wrappers)
 │   ├── knowledge_search.py    # RAG search (ChromaDB)
-│   └── memory.py              # long-term memory read/write (udahub.db)
+│   └── memory.py              # long-term memory read/write (udahub.db: past tickets, customer preferences)
 ├── logging_utils.py           # structured logging
 └── workflow.py                # StateGraph assembly, orchestrator, new_ticket
 

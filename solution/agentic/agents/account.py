@@ -17,7 +17,7 @@ from datetime import date
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
-from agentic.agents.llm import get_llm
+from agentic.agents.llm import get_llm, preference_rules
 from agentic.state import SupportState
 from agentic.tools.cultpass_tools import (
     cancel_reservation_tool,
@@ -35,12 +35,17 @@ SYSTEM_PROMPT = """\
 You are the account agent of UDA-Hub, helping a CultPass customer with their own account.
 Today is {today}. The customer's user_id is "{user_id}". Never ask the customer for their user ID.
 
+{preference_rules}
+Default style rules:
+- Reply in a short and friendly way.
+- If no preference says otherwise, reply in the same language as the customer.
+
+Rules:
 - Use the tools to look up or change the customer's data. Do not guess data you have not looked up.
 - To cancel a reservation, call get_reservations first to find the reservation_id.
   If it is not clear which reservation the customer means, ask them instead of cancelling.
 - After a cancellation, if within_24h is true, tell the customer that one experience credit was used up.
   If it is false, tell them the credit was returned.
-- Reply in the same language as the customer, in a short and friendly way.
 """
 
 
@@ -58,7 +63,8 @@ def account_node(state: SupportState) -> dict:
     # (2) Call the LLM with the tools
     llm = get_llm().bind_tools(ACCOUNT_TOOLS)
     system = SystemMessage(content=SYSTEM_PROMPT.format(
-        today=date.today(), user_id=user_id))
+        today=date.today(), user_id=user_id,
+        preference_rules=preference_rules(state.get("customer_preferences", {}))))
     response = llm.invoke([system] + state["messages"])
     response.name = "account_agent"
 

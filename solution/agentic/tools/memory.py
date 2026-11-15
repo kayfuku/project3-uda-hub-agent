@@ -7,7 +7,8 @@ This module handles "long-term memory" that persists across tickets.
      │  mapped via udahub.users.external_user_id
      ▼
   udahub.users ──< tickets ──┬── ticket_metadata (status, main_issue_type, tags)
-                             └──< ticket_messages (role, content)
+       │                     └──< ticket_messages (role, content)
+       └──< customer_preferences (pref_key, pref_value)
 
 These are called by graph nodes (load_memory / save_memory), not by the LLM as tools.
 So there are no @tool wrappers.
@@ -34,6 +35,7 @@ ACCOUNT_ID = "cultpass"                       # first customer
 VALID_STATUSES = {"open", "resolved", "escalated"}
 PAST_TICKET_LIMIT = 3                         # up to 3 past tickets, newest first
 SNIPPET_LENGTH = 150                          # max characters per message in the summary
+PREFERENCE_KEYS = ("language", "interests", "others")  # kinds of customer preferences
 
 _engine = create_engine(f"sqlite:///{UDAHUB_DB_PATH}")
 Session = sessionmaker(bind=_engine)
@@ -187,6 +189,41 @@ def load_past_context(external_user_id: str, current_ticket_id: str | None = Non
     return _ok({"tickets": tickets, "summary": _format_summary(tickets)})
 
 
+def load_preferences(external_user_id: str) -> dict:
+    """Return the customer's saved preferences as {pref_key: pref_value}.
+
+    Example of data: {"language": "Japanese", "interests": "jazz concerts"}
+    A first-time user is not an error (data is just an empty dict).
+    """
+    if not external_user_id:
+        return _error("external_user_id is required")
+    if _db_missing():
+        return _error(f"UDA-Hub DB not found: {UDAHUB_DB_PATH}")
+
+    try:
+        with Session() as session:
+            rows = (
+                session.query(udahub.CustomerPreference)
+                .join(udahub.User)
+                .filter(udahub.User.account_id == ACCOUNT_ID,
+                        udahub.User.external_user_id == external_user_id)
+                .all()
+            )
+            return _ok({r.pref_key: r.pref_value for r in rows})
+    except SQLAlchemyError as e:
+        return _error(f"Database error: {e}")
+
+
+def format_preferences(preferences: dict) -> str:
+    """Turn preferences into text for the LLM prompts.
+
+    Example: {"language": "Japanese", "others": "Short replies"} -> "language: Japanese; others: Short replies"
+    """
+    items = [f"{key}: {preferences[key]}" for key in PREFERENCE_KEYS
+             if preferences and preferences.get(key)]
+    return "; ".join(items) or "None"
+
+
 def _format_summary(tickets: list[dict]) -> str:
     """Example: - 2026-11-10 [resolved] technical (qr_code): "The QR code..." → "Please..." """
     if not tickets:
@@ -289,6 +326,44 @@ def save_handoff_summary(ticket_id: str, summary: str) -> dict:
             session.add(message)
             session.commit()
             return _ok({"ticket_id": ticket_id, "message_id": message.message_id})
+    except SQLAlchemyError as e:
+        return _error(f"Database error: {e}")
+
+
+def save_preferences(external_user_id: str, preferences: dict) -> dict:
+    """Save the customer's preferences to customer_preferences.
+
+    - Only the keys in PREFERENCE_KEYS are saved. Empty values are skipped.
+    - If the key is already saved, the value is overwritten (the newest statement wins).
+    - Keys that are not passed are kept as they are.
+    """
+    if not external_user_id:
+        return _error("external_user_id is required")
+    if _db_missing():
+        return _error(f"UDA-Hub DB not found: {UDAHUB_DB_PATH}")
+
+    cleaned = {key: str(value).strip() for key, value in (preferences or {}).items()
+               if key in PREFERENCE_KEYS and value and str(value).strip()}
+    if not cleaned:
+        return _ok({"saved": []})
+
+    try:
+        with Session() as session:
+            user = session.query(udahub.User).filter_by(
+                account_id=ACCOUNT_ID, external_user_id=external_user_id,
+            ).first()
+            if user is None:
+                return _error(f"User not found: {external_user_id}")
+
+            for key, value in cleaned.items():
+                row = session.get(udahub.CustomerPreference, (user.user_id, key))
+                if row is None:
+                    session.add(udahub.CustomerPreference(
+                        user_id=user.user_id, pref_key=key, pref_value=value))
+                else:
+                    row.pref_value = value
+            session.commit()
+            return _ok({"saved": sorted(cleaned)})
     except SQLAlchemyError as e:
         return _error(f"Database error: {e}")
 

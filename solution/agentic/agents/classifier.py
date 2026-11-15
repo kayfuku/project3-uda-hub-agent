@@ -3,8 +3,13 @@
 Decides the route (category) and urgency from the ticket content and metadata.
 Uses LLM structured output (a Pydantic model), so the output shape is always the same.
 
-  Input:  latest user message, recent conversation (up to 6 messages), ticket_metadata, past_context
-  Output: {"category": ..., "urgency": ..., "classification_reason": ...}
+It also picks up preferences the customer clearly states (language / interests / others),
+so no extra LLM call is needed. save_memory saves them to udahub.db.
+
+  Input:  latest user message, recent conversation (up to 6 messages), ticket_metadata, past_context,
+          saved customer_preferences
+  Output: {"category": ..., "urgency": ..., "classification_reason": ...,
+           "new_preferences": ..., "customer_preferences": ...}
 """
 from typing import Literal
 
@@ -13,9 +18,20 @@ from pydantic import BaseModel, Field
 
 from agentic.agents.llm import get_llm
 from agentic.state import SupportState
+from agentic.tools.memory import format_preferences
 
 # How many recent messages to pass (to classify short replies like "Yes, please cancel it")
 RECENT_MESSAGE_LIMIT = 6
+
+
+class StatedPreferences(BaseModel):
+    """Preferences the customer clearly stated. Empty string = not stated."""
+    language: str = Field(
+        description="Language the customer wants replies in, e.g. Japanese. Empty string if not stated.")
+    interests: str = Field(
+        description="Kinds of experiences the customer likes, e.g. jazz concerts. Empty string if not stated.")
+    others: str = Field(
+        description="Any other lasting preference, e.g. prefers short replies. Empty string if not stated.")
 
 
 class Classification(BaseModel):
@@ -28,6 +44,8 @@ class Classification(BaseModel):
     )
     reason: str = Field(
         description="One short sentence explaining the decision.")
+    stated_preferences: StatedPreferences = Field(
+        description="Lasting preferences the customer clearly stated in the latest message.")
 
 
 # The classification rules match the table in design doc Section 3.1
@@ -57,6 +75,17 @@ urgency:
 Use the ticket metadata and the past context only as hints. The latest message is the most important.
 If the latest message is a short reply (for example "yes", "no", "the first one") to a question
 the assistant asked in the recent conversation, choose the category of that question.
+
+stated_preferences (saved for the customer's future inquiries):
+- Fill a field ONLY when the latest message clearly states a lasting preference. Do not guess.
+  Just writing in a language is not a preference. "Please always reply in Japanese" is.
+- language: the language the customer wants replies in.
+- interests: kinds of experiences the customer likes, e.g. "jazz concerts, museums".
+- others: any other lasting preference, e.g. "Prefers short replies", "Prefers to be contacted by email".
+  Never include contact details such as email addresses or phone numbers.
+- If "Saved customer preferences" already has interests or others, include the saved content
+  together with the new one (the new value replaces the saved one).
+- Write the values in English. Use an empty string for anything not stated.
 """
 
 
@@ -91,7 +120,8 @@ def classifier_node(state: SupportState) -> dict:
     """Classify the ticket and return only the fields to write to the State."""
     user_prompt = (
         f"Ticket metadata: {state.get('ticket_metadata', {})}\n"
-        f"Past context: {state.get('past_context') or 'None'}\n\n"
+        f"Past context: {state.get('past_context') or 'None'}\n"
+        f"Saved customer preferences: {format_preferences(state.get('customer_preferences', {}))}\n\n"
         f"Recent conversation:\n{_recent_conversation(state)}\n\n"
         f"Latest customer message:\n{_latest_user_message(state)}"
     )
@@ -102,8 +132,16 @@ def classifier_node(state: SupportState) -> dict:
         HumanMessage(content=user_prompt),
     ])
 
+    # Keep only the preferences that were stated
+    new_preferences = {key: value.strip()
+                       for key, value in result.stated_preferences.model_dump().items()
+                       if value.strip()}
+
     return {
         "category": result.category,
         "urgency": result.urgency,
         "classification_reason": result.reason,
+        "new_preferences": new_preferences,
+        # Merge now, so the agents can use the new preferences in this turn too
+        "customer_preferences": {**state.get("customer_preferences", {}), **new_preferences},
     }

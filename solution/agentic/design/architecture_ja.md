@@ -23,7 +23,7 @@ UDA-Hub は、カスタマーサポートのチケットを自動で処理する
 
 ```mermaid
 flowchart TD
-    START([チケット受信]) --> LOAD[load_memory<br/>チケット情報と過去のやり取りを取得]
+    START([チケット受信]) --> LOAD[load_memory<br/>チケット情報・過去のやり取り・<br/>顧客の好みを取得]
     LOAD --> CLS[Classifier Agent<br/>分類・緊急度判定]
 
     CLS -->|knowledge| KNOW[Knowledge Agent<br/>RAG で記事検索 → 回答]
@@ -39,7 +39,7 @@ flowchart TD
     ACC -->|最終回答| SAVE
     ACC -->|ユーザー不明・ブロック済み| ESC
 
-    ESC --> SAVE[save_memory<br/>会話・結果を DB に保存]
+    ESC --> SAVE[save_memory<br/>会話・結果・新しい好みを DB に保存]
     SAVE --> END([回答を返す])
 ```
 
@@ -56,12 +56,14 @@ flowchart TD
 
 | 項目 | 内容 |
 |---|---|
-| 責任 | チケットの内容とメタデータから、行き先と緊急度を決める |
-| 入力 | 最新のユーザーメッセージ、直前の会話（ユーザーと AI の本文、最大6件）、チケットのメタデータ（`channel`、`main_issue_type`、`tags`、`created_at`）、過去のやり取りの要約（`past_context`） |
-| 出力 | `category`（`knowledge` / `account` / `escalation`）、`urgency`（`low` / `medium` / `high`）、`reason`（判断理由。State には `classification_reason` として入れる） |
+| 責任 | チケットの内容とメタデータから、行き先と緊急度を決める。顧客がはっきり言った好みも拾う |
+| 入力 | 最新のユーザーメッセージ、直前の会話（ユーザーと AI の本文、最大6件）、チケットのメタデータ（`channel`、`main_issue_type`、`tags`、`created_at`）、過去のやり取りの要約（`past_context`）、保存済みの顧客の好み（`customer_preferences`） |
+| 出力 | `category`（`knowledge` / `account` / `escalation`）、`urgency`（`low` / `medium` / `high`）、`reason`（判断理由。State には `classification_reason` として入れる）、`stated_preferences`（State には `new_preferences` として入れる） |
 | 方法 | LLM の構造化出力（Pydantic モデル `Classification`） |
 
 直前の会話を渡すのは、「Yes, please cancel it」のような短い返事を、その前の質問と同じ行き先に振り分けるためである。
+
+好みは同じ LLM の呼び出しで抽出するので、呼び出しは増えない（7.1 節）。顧客がはっきり言った好みだけを抽出する。ある言語で書いただけでは好みとして扱わず、「今後は日本語で返信してください」なら好みとして扱う。新しい好みはすぐに `customer_preferences` にも反映するので、同じターンの返信から効く。
 
 分類の基準は次のとおり。
 
@@ -84,7 +86,7 @@ flowchart TD
 | 項目 | 内容 |
 |---|---|
 | 責任 | ナレッジ記事を検索し、**記事の内容だけ**に基づいて回答する |
-| 入力 | 最新のユーザーメッセージ、`past_context` |
+| 入力 | 最新のユーザーメッセージ、`past_context`、`customer_preferences` |
 | 出力 | 回答文（`AIMessage`）、`retrieved_articles`（検索した記事のタイトルとスコア）、`confidence`（信頼度） |
 | 方法 | RAG（第5章）。① `search_knowledge` をコードで直接呼ぶ（LLM のツール呼び出しにはしない）。② 信頼度がしきい値未満なら、LLM を呼ばずにエスカレーションする。③ しきい値以上なら、上位3件を LLM に渡し、構造化出力（`KnowledgeAnswer`）で回答させる。記事にない内容は答えないよう指示する |
 | エスカレーション条件 | 検索が失敗したとき。`confidence` がしきい値未満のとき。LLM が `needs_escalation = True` を返したとき（記事自体がエスカレーションを指示していて、ユーザーの状況がその条件に当てはまる。または、記事に答えがない） |
@@ -97,7 +99,7 @@ flowchart TD
 | 項目 | 内容 |
 |---|---|
 | 責任 | ツールで CultPass DB を照会・操作し、ユーザー個別の依頼を処理する |
-| 入力 | 会話全体（`messages`）、チケットのユーザーに対応する CultPass の `user_id` |
+| 入力 | 会話全体（`messages`）、チケットのユーザーに対応する CultPass の `user_id`、`customer_preferences` |
 | 出力 | ツールの結果をもとにした回答文 |
 | 方法 | ① `get_user_profile(user_id)` をコードで直接呼び、ユーザーの有無とブロックを確認する（LLM には任せない）。② LLM にツールを渡し（`bind_tools`）、`account ⇄ account_tools` のループで呼び出す。ループはグラフ上に自分で組む。③ `account_tools` は、LLM が指定した `user_id` を State の値で上書きしてから実行する（他人のデータを操作させないため） |
 | エスカレーション条件 | ユーザーが見つからない、アカウントがブロックされている（`is_blocked`）— `account` ノードで判定。ツールがエラーを返した（`ok: False`）— `account_tools` ノードで判定 |
@@ -110,8 +112,8 @@ flowchart TD
 | 項目 | 内容 |
 |---|---|
 | 責任 | 人間の担当者に引き継ぐ。担当者がすぐ対応できるよう要約を残す |
-| 入力 | 会話全体、エスカレーションの理由（`escalation_reason`。Classifier から直接来たときは `classification_reason`）、緊急度、`past_context`、このターンで先に出した案内（あれば） |
-| 出力 | ユーザー向けのメッセージ（ユーザーの言語。「担当者が対応します」）、担当者向けの要約（`handoff_summary`、英語） |
+| 入力 | 会話全体、エスカレーションの理由（`escalation_reason`。Classifier から直接来たときは `classification_reason`）、緊急度、`past_context`、`customer_preferences`、このターンで先に出した案内（あれば） |
+| 出力 | ユーザー向けのメッセージ（好みの言語。保存されていなければユーザーの言語。「担当者が対応します」）、担当者向けの要約（`handoff_summary`、英語。連絡手段など、対応に関係する好みも含める） |
 | 方法 | LLM の構造化出力（`EscalationOutput`）。最初に `customer_language` を答えさせて、返信の言語を先に決めさせる |
 | 副作用 | なし。DB への書き込み（`status` を `escalated` にする、要約を保存する、緊急度をタグに記録する）は `save_memory` が行う（第7章） |
 
@@ -134,6 +136,8 @@ class SupportState(MessagesState):
     user_id: str                      # CultPass 側のユーザー ID
     ticket_metadata: dict             # channel, main_issue_type, tags など
     past_context: str                 # 過去のやり取りの要約（長期メモリ）
+    customer_preferences: dict        # 保存済みの好み + このターンで言われた好み（長期メモリ）
+    new_preferences: dict             # このターンで言われた好み（save_memory が保存する）
     category: str                     # Classifier の分類結果（knowledge / account / escalation）
     urgency: str                      # low / medium / high
     classification_reason: str        # Classifier の判断理由
@@ -144,19 +148,20 @@ class SupportState(MessagesState):
     resolution: str                   # resolved / escalated
 ```
 
-- グラフに渡すのは `messages` と `thread_id`（= `ticket_id`）だけ。`user_id` と `ticket_metadata` は、`load_memory` が `ticket_id` から udahub.db を引いて State に入れる。
-- `MemorySaver` は State を丸ごと残すので、`load_memory` はターンの最初に `category` から `resolution` までの「ターンごとの結果」をリセットする。リセットしないと、前のターンの `escalation_reason` が残って間違った行き先に進んでしまう。
+- グラフに渡すのは `messages` と `thread_id`（= `ticket_id`）だけ。`user_id`、`ticket_metadata`、`past_context`、`customer_preferences` は、`load_memory` が `ticket_id` から udahub.db を引いて State に入れる。
+- `MemorySaver` は State を丸ごと残すので、`load_memory` はターンの最初に「ターンごとの結果」（`new_preferences` と、`category` から `resolution` まで）をリセットする。リセットしないと、前のターンの `escalation_reason` が残って間違った行き先に進んでしまう。
 
 具体例として、「来週の予約をキャンセルしたい」というチケットの処理を順に追う。
 
 ```
 ① load_memory      ticket_id から user_id を取得。past_context = "- 2026-11-10 [resolved] ...: "The QR code won't scan..." → ..."
-② classifier       category = "account", urgency = "medium"
+                   customer_preferences = {"language": "Japanese"}
+② classifier       category = "account", urgency = "medium", new_preferences = {}（新しい好みは言われていない）
 ③ account          get_user_profile(user_id) をコードで確認 → OK。LLM が get_reservations(user_id) を呼ぶ
 ④ account_tools    → {"ok": true, "data": [{"reservation_id": "r1", ...}]}
 ⑤ account          LLM が cancel_reservation(user_id, "r1") を呼ぶ
 ⑥ account_tools    → {"ok": true, "data": {"status": "cancelled", "within_24h": false, ...}}
-⑦ account          回答「予約をキャンセルしました。クレジットは戻ります」 resolution = "resolved"
+⑦ account          保存された好みに従い日本語で回答「ご予約をキャンセルしました。クレジットは返却されます。」 resolution = "resolved"
 ⑧ save_memory      ticket_messages に会話を保存し、status = "resolved"、main_issue_type = "account"、tags = "urgency:medium" にする
 ```
 
@@ -271,7 +276,8 @@ flowchart LR
 | 種類 | スコープ | 保存先 | 中身 | 使い方 |
 |---|---|---|---|---|
 | 短期メモリ | `thread_id`（= `ticket_id`） | LangGraph `MemorySaver` | 同じチケット内の会話、ツール呼び出しとその結果、State | 同じチケットで会話を続けるときの文脈 |
-| 長期メモリ | ユーザー（`user_id`） | udahub.db（`ticket_messages`、`ticket_metadata`） | 過去のチケットの会話、解決・エスカレーションの結果、担当者向けの要約 | `load_memory` が同じユーザーの過去チケットを取り出し、`past_context` として Classifier、Knowledge、Escalation に渡す |
+| 長期メモリ（過去のチケット） | ユーザー（`user_id`） | udahub.db（`ticket_messages`、`ticket_metadata`） | 過去のチケットの会話、解決・エスカレーションの結果、担当者向けの要約 | `load_memory` が同じユーザーの過去チケットを取り出し、`past_context` として Classifier、Knowledge、Escalation に渡す |
+| 長期メモリ（顧客の好み） | ユーザー（`user_id`） | udahub.db（`customer_preferences`） | 顧客が言った好み：`language`、`interests`、`others` | `load_memory` が `customer_preferences` として読み込む。Knowledge、Account、Escalation は返信のときにそれに従う（7.1 節） |
 
 長期メモリの読み書きは `agentic/tools/memory.py` の関数で行う。LLM がツールとして呼ぶのではなく、グラフのノード（`load_memory` / `save_memory`）が呼ぶので、`@tool` ラッパーは作らない。
 
@@ -284,6 +290,7 @@ flowchart LR
 
 - `thread_id` からチケットを引き、CultPass の `user_id` と `ticket_metadata` を State に入れる。
 - 同じユーザーの過去のチケット（今のチケットを除く）を新しい順に最大3件取り出し、日付、結果、分類、最初のユーザーの発言と最後の AI の発言（各150文字まで）を短い文章にまとめて `past_context` にする。初めてのユーザーは「No past tickets from this customer.」になる。
+- 同じユーザーの保存済みの好みを `customer_preferences` に入れる（初めてのユーザーは `{}`）。
 - DB の関数がエラーを返してもグラフは止めない（`user_id` が空なら、Account Agent がエスカレーションする）。
 
 **保存（`save_memory`）** — udahub.db に書くのはこのノードだけ（エージェントは書かない）。
@@ -292,10 +299,41 @@ flowchart LR
 - エスカレーションしたときは、`handoff_summary` を `role = system`（`[Handoff] ...`）で `ticket_messages` に保存する。`past_context` には user と ai の発言しか使わないので、要約は混ざらない。
 - `ticket_metadata` の `status` をそのターンの結果（`resolved` / `escalated`、結果がなければ `open`）で上書きする。ただし一度 `escalated` になったチケットは `escalated` のままにする（担当者の対応待ちが、次のターンの `resolved` で見えなくならないように）。
 - `main_issue_type` に Classifier の `category` を、`tags` に `urgency:<緊急度>` を記録する。
+- このターンで言われた好み（`new_preferences`）を `customer_preferences` に保存する。
 
 **例**：前回「QRコードが読めない」で解決したユーザーが再び来たら、`past_context` にそのチケットが入るので、「前回も QR コードの件でお問い合わせいただきました」と文脈を踏まえて応答できる。
 
 `thread_id` を指定すれば、`graph.get_state(config)` や `graph.get_state_history(config)` でそのチケットのメッセージやツール使用状況を確認できる。
+
+### 7.1 顧客の好み
+
+過去のチケットだけでは、顧客がどう対応してほしいかがわからない。そこで、好みを専用のテーブルに保存する。
+
+```text
+チケット A（1 回目のセッション）
+  顧客:「Please always reply in Japanese from now on. I love jazz concerts. Is my subscription still active?」
+    classifier   new_preferences = {"language": "Japanese", "interests": "jazz concerts"}
+    account      日本語で返信（好みはこのターンから効く）
+    save_memory  customer_preferences に保存
+
+チケット B（2 回目のセッション：thread_id が新しいので短期メモリは空）
+  load_memory    customer_preferences = {"language": "Japanese", "interests": "jazz concerts"}
+  顧客:「The QR code won't scan」（英語）
+    knowledge    保存された好みに従い日本語で返信
+```
+
+**テーブル `customer_preferences`**（`data/models/udahub.py`）：1 ユーザーにつき 1 キー 1 行。主キーは（`user_id`、`pref_key`）。
+
+| `pref_key` | 内容 | 例 |
+|---|---|---|
+| `language` | 返信してほしい言語 | `Japanese` |
+| `interests` | 好きな体験の種類 | `jazz concerts, museums` |
+| `others` | そのほかの続く好み | `Prefers short replies`、`Prefers to be contacted by email` |
+
+- **抽出**：Classifier が構造化出力で `stated_preferences` を返す。メールアドレスや電話番号などの連絡先は保存しない。`interests` や `others` にすでに値があるときは、保存済みの内容と新しい内容を合わせて返させる。
+- **保存**：`save_preferences`（`save_memory` から呼ぶ）は、渡されたキーだけを上書きし、ほかのキーは残す。対象外のキーと空の値は保存しない。
+- **使い方**：`agentic/agents/llm.py` の `PREFERENCE_RULES` を、Knowledge、Account、Escalation の System プロンプトの先頭に置く。顧客の好みは既定の書き方のルール（「顧客と同じ言語で返信する」など）より優先する、と書いてある。ルールは好みの種類に関係しないので、キーを増やしてもエージェントを変える必要はない。
+- **守らせるための工夫**：Knowledge Agent の構造化出力（`KnowledgeAnswer`）の最初に `applied_preferences` を置き、従う好みを回答の前に写させる（これがないと、日本語を好む顧客に英語で返すことがあった）。Escalation Agent の `handoff_summary` には、保存された好みだけを書き、推測では書かない。
 
 ---
 
@@ -310,6 +348,7 @@ flowchart LR
 | ユーザー不明・ブロック済み | Classifier → Account → Escalation | 引き継ぎのメッセージ。`escalated` | シナリオ 4（ブロック済み）、シナリオ 6（CultPass にいない） |
 | ツールのエラー | Classifier → Account ⇄ Tools → Escalation | 引き継ぎのメッセージ。`escalated` | — |
 | 明確に人を求める・苦情 | Classifier → Escalation | 引き継ぎのメッセージ。緊急度を記録して `escalated` | シナリオ 5（責任者と話したい） |
+| 顧客が好みを言い、別のセッションで再び来る | Classifier → Account、次に（新しいチケットで）Classifier → Knowledge | 好みが保存され、次のチケットの返信がそれに従う。`resolved` | シナリオ 7 |
 
 ---
 
@@ -321,13 +360,13 @@ flowchart LR
 
 | node | event | 主な項目 |
 |---|---|---|
-| `load_memory` | `memory_loaded` | `user_id`、`past_tickets`（過去チケットの件数）、`error` |
-| `classifier` | `classified` | `category`、`urgency`、`reason` |
+| `load_memory` | `memory_loaded` | `user_id`、`past_tickets`（過去チケットの件数）、`preferences`（保存済みの好みのキー）、`errors` |
+| `classifier` | `classified` | `category`、`urgency`、`reason`、`stated_preferences`（このターンで言われた好みのキー） |
 | `knowledge` | `retrieved` | `top_article`、`confidence`、`escalation_reason` |
 | `account` | `account_step` | `tool_calls`（LLM が呼んだツール名）、`escalation_reason` |
 | `account_tools` | `tool_called` | `tool`、`ok`、`error`（ツールごとに1行） |
 | `escalation` | `escalated` | `reason`、`urgency` |
-| `save_memory` | `saved` | `status`、`resolution`、`errors`（DB の関数のエラー） |
+| `save_memory` | `saved` | `status`、`resolution`、`preferences_saved`（保存した好みのキー）、`errors`（DB の関数のエラー） |
 
 ```json
 {"ts": "2026-11-14T10:00:00", "ticket_id": "t-001", "node": "classifier", "event": "classified", "category": "knowledge", "urgency": "low", "reason": "..."}
@@ -344,8 +383,9 @@ flowchart LR
 |---|---|---|
 | ツールの単体テスト | 正常系、存在しないユーザー、ブロック済みのユーザー、他人の予約のキャンセル、キャンセル済みの予約、開始済みのイベント、24時間以内のキャンセル、引数の不足、DB ファイルがない、`@tool` ラッパーが本体と同じ結果を返す | `tests/test_cultpass_tools.py` |
 | ナレッジ検索 | 関係のある質問のスコアがしきい値以上で、関係のない質問はしきい値未満になる。スコアの高い順に並ぶ。空の質問や検索の失敗はエラーを返す | `tests/test_knowledge_search.py` |
-| 長期メモリ | チケットの作成、メッセージの保存（二重に保存しない）、status の更新、過去のチケットの取り出し（新しい順・件数の上限・ユーザーを混ぜない）、引き継ぎの要約が `past_context` に混ざらない | `tests/test_memory.py` |
-| ルーティング・エンドツーエンド | サンプルチケットごとに期待するエージェントへ振り分けられ、「解決」と「エスカレーション」の両方のシナリオが動く（第8章の表） | `03_agentic_app.ipynb` のシナリオ 1〜6 |
+| 長期メモリ | チケットの作成、メッセージの保存（二重に保存しない）、status の更新、過去のチケットの取り出し（新しい順・件数の上限・ユーザーを混ぜない）、引き継ぎの要約が `past_context` に混ざらない、顧客の好み（チケットをまたいで残る・渡したキーだけ上書き・対象外のキーと空の値は保存しない・ユーザーを混ぜない） | `tests/test_memory.py` |
+| ルーティング・エンドツーエンド | サンプルチケットごとに期待するエージェントへ振り分けられ、「解決」と「エスカレーション」の両方のシナリオが動く（第8章の表） | `03_agentic_app.ipynb` のシナリオ 1〜7 |
+| セッションをまたぐ顧客の好み | あるチケットで言われた好みが新しいチケットで読み込まれ、返信がそれに従う | `03_agentic_app.ipynb` のシナリオ 7 |
 | 短期メモリ | 同じ `thread_id` で会話が続く（シナリオ 2 の2回目の質問）。`get_state_history` でツールの呼び出しも確認できる | `03_agentic_app.ipynb` |
 
 - `tests/` は pytest で実行する（`solution/` から `pytest`）。ナレッジ検索の一部のテストは、埋め込みの API を呼ぶ。
@@ -362,7 +402,7 @@ solution/agentic/
 │   └── architecture_ja.md     # この設計書（日本語版）
 ├── state.py                   # 共有する State（SupportState）
 ├── agents/
-│   ├── llm.py                 # 4つのエージェントが共有する LLM（get_llm）
+│   ├── llm.py                 # 4つのエージェントが共有する LLM（get_llm）、好みの共通ルール（PREFERENCE_RULES）
 │   ├── classifier.py
 │   ├── knowledge.py
 │   ├── account.py             # account ノードと account_tools ノード
@@ -370,7 +410,7 @@ solution/agentic/
 ├── tools/
 │   ├── cultpass_tools.py      # CultPass DB ツール（本体 + @tool ラッパー）
 │   ├── knowledge_search.py    # RAG 検索（ChromaDB）
-│   └── memory.py              # 長期メモリの読み書き（udahub.db）
+│   └── memory.py              # 長期メモリの読み書き（udahub.db：過去のチケット、顧客の好み）
 ├── logging_utils.py           # 構造化ログ
 └── workflow.py                # StateGraph の組み立て、orchestrator、new_ticket
 

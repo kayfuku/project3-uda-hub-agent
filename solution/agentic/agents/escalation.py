@@ -3,6 +3,7 @@
 Hands off to a human agent, leaving a summary so they can act right away.
 
   Input:   full conversation, escalation_reason (or classification_reason if missing), urgency,
+           customer_preferences (reply language, contact method, etc.),
            any guidance already given this turn (if present, the code prepends it to customer_message)
   Output:  customer_message (for the customer, in the customer's language)
            handoff_summary (for the human agent, in English)
@@ -15,7 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from pydantic import BaseModel, Field
 
 from agentic.agents.classifier import _latest_user_message
-from agentic.agents.llm import get_llm
+from agentic.agents.llm import get_llm, preference_rules
 from agentic.state import SupportState
 
 
@@ -26,9 +27,10 @@ class EscalationOutput(BaseModel):
     (without it, the agent sometimes replied in Spanish to an English inquiry).
     """
     customer_language: str = Field(
-        description="Language of the customer's latest message, e.g. English, Japanese.")
+        description="Language for the reply: the language in the customer preferences if set, "
+                    "otherwise the language of the customer's latest message. e.g. English, Japanese.")
     customer_message: str = Field(
-        description="Short message to the customer, in the customer's language.")
+        description="Short message to the customer, in customer_language.")
     handoff_summary: str = Field(
         description="Summary for the human support agent, in English.")
 
@@ -37,8 +39,9 @@ SYSTEM_PROMPT = """\
 You are the escalation agent of UDA-Hub (customer support for CultPass).
 This ticket is being handed over to a human support agent. Write two things.
 
+{preference_rules}
 customer_message (to the customer):
-- Write in customer_language (the language of the customer's latest message). Keep it short, polite and calm.
+- Write in customer_language. Keep it short, polite and calm.
 - Tell them a member of our support team will follow up.
 - Do not mention internal details such as confidence scores, tool names, error messages
   or that the account is "blocked". Say "our team needs to review your request" instead.
@@ -47,6 +50,8 @@ customer_message (to the customer):
 
 handoff_summary (to the human agent, in English, 2-4 short lines):
 - The customer's issue, the escalation reason, the urgency, and what has already been tried or answered.
+- Add the saved customer preferences that matter for the follow-up (for example preferred language or contact method).
+  Use only what is written in "Customer preferences". If it is None, do not mention preferences.
 """
 
 
@@ -98,7 +103,8 @@ def escalation_node(state: SupportState) -> dict:
     )
     llm = get_llm().with_structured_output(EscalationOutput)
     result = llm.invoke([
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=SYSTEM_PROMPT.format(
+            preference_rules=preference_rules(state.get("customer_preferences", {})))),
         HumanMessage(content=user_prompt),
     ])
 

@@ -9,7 +9,7 @@ UDA-Hub は、カスタマーサポートのチケットを自動で処理する
 
 ```mermaid
 flowchart TD
-    START([チケット受信]) --> LOAD[load_memory<br/>チケット情報と過去のやり取りを取得]
+    START([チケット受信]) --> LOAD[load_memory<br/>チケット情報・過去のやり取り・<br/>顧客の好みを取得]
     LOAD --> CLS[Classifier Agent<br/>分類・緊急度判定]
 
     CLS -->|knowledge| KNOW[Knowledge Agent<br/>RAG で記事検索 → 回答]
@@ -25,7 +25,7 @@ flowchart TD
     ACC -->|最終回答| SAVE
     ACC -->|ユーザー不明・ブロック済み| ESC
 
-    ESC --> SAVE[save_memory<br/>会話・結果を DB に保存]
+    ESC --> SAVE[save_memory<br/>会話・結果・新しい好みを DB に保存]
     SAVE --> END([回答を返す])
 ```
 
@@ -46,7 +46,7 @@ flowchart TD
 
 | エージェント                       | 役割                                                                                                                  |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **Classifier**（スーパーバイザー） | チケットの内容とメタデータから、カテゴリ（`knowledge` / `account` / `escalation`）と緊急度を決める                    |
+| **Classifier**（スーパーバイザー） | チケットの内容とメタデータから、カテゴリ（`knowledge` / `account` / `escalation`）と緊急度を決める。お客さんがはっきり言った好みも拾う |
 | **Knowledge**                      | ナレッジ記事をベクトル検索（RAG）し、記事の内容だけをもとに回答する。信頼度がしきい値（0.30）未満ならエスカレーション |
 | **Account**                        | CultPass DB のツール（プロフィール、サブスクリプション、予約の照会・キャンセル）を使って回答する                      |
 | **Escalation**                     | お客さん向けの案内文と、担当者向けの引き継ぎ要約（handoff summary）を作る                                             |
@@ -88,7 +88,7 @@ sqlalchemy, python-dotenv, pytest など
    | ノートブック                 | 作るもの                                                                                                                       |
    | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
    | `01_external_db_setup.ipynb` | `data/external/cultpass.db`（CultPass 側：users、subscriptions、experiences、reservations）                                    |
-   | `02_core_db_setup.ipynb`     | `data/core/udahub.db`（UDA-Hub 本体：accounts、users、tickets、ticket_metadata、ticket_messages、knowledge。記事 14 件を含む） |
+   | `02_core_db_setup.ipynb`     | `data/core/udahub.db`（UDA-Hub 本体：accounts、users、tickets、ticket_metadata、ticket_messages、customer_preferences、knowledge。記事 14 件を含む） |
 
    ナレッジ検索用の ChromaDB（`data/core/chroma/`）は、初めて検索したときに udahub.db の記事から自動で作られます。
 
@@ -97,8 +97,8 @@ sqlalchemy, python-dotenv, pytest など
 `solution/` で `03_agentic_app.ipynb` を上から実行します。
 
 - グラフの図を表示します。
-- サンプルチケットで 6 つのシナリオを実演します（下の表）。
-- State の履歴（`thread_id` ごと）、DB に保存された会話、ログを確認します。
+- サンプルチケットで 7 つのシナリオを実演します（下の表）。
+- State の履歴（`thread_id` ごと）、DB に保存された会話と顧客の好み、ログを確認します。
 - 最後のセルで `chat_interface()` による対話モードを使えます（`q` で終了）。
 
 | シナリオ | 内容                                                                   | 期待する流れ                                              |
@@ -109,6 +109,7 @@ sqlalchemy, python-dotenv, pytest など
 | 4        | ブロック済みユーザーの予約キャンセル                                   | account → escalated                                       |
 | 5        | ギフトカード／日本語で責任者を希望                                     | knowledge → escalated／escalation → escalated             |
 | 6        | CultPass に登録のないユーザー                                          | account → escalated（`User not found`）                   |
+| 7        | 「今後は日本語で返信して…」→ 新しいチケットで英語の質問                 | account → resolved、次に knowledge → 日本語で resolved（顧客の好み・長期メモリ） |
 
 注意：
 
@@ -128,13 +129,13 @@ sqlalchemy, python-dotenv, pytest など
 
 ### テストの内訳
 
-全 49 件です。
+全 55 件です。
 
 | ファイル                         | 件数 | 何を確かめるか                                                                                                                                                                                                                                                      |
 | -------------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tests/test_cultpass_tools.py`   | 20   | CultPass DB ツール。ユーザーの照会、サブスクリプション、予約の一覧、予約のキャンセル（24 時間以内の判定、キャンセル済み、他人の予約、ブロック済みユーザー、開始済みのイベント）。DB がない・引数がないときに、例外ではなく `{"ok": False, "error": ...}` を返すこと |
 | `tests/test_knowledge_search.py` | 9    | ナレッジ検索。空の質問や検索の失敗でエラーを返すこと、記事の読み込み、ツールのラッパー。関係のある質問は信頼度がしきい値以上、関係のない質問は未満になること、記事がスコア順に並ぶこと                                                                              |
-| `tests/test_memory.py`           | 20   | 長期メモリ（udahub.db）。チケットの作成、会話の保存（二重保存しない）、ステータスの更新、過去のやり取りの取得（新しい順・件数の上限・他のユーザーと混ざらない）、引き継ぎ要約の保存                                                                                 |
+| `tests/test_memory.py`           | 26   | 長期メモリ（udahub.db）。チケットの作成、会話の保存（二重保存しない）、ステータスの更新、過去のやり取りの取得（新しい順・件数の上限・他のユーザーと混ざらない）、引き継ぎ要約の保存、顧客の好み（チケットをまたいで残る・渡したキーだけ上書き・対象外のキーと空の値は保存しない・他のユーザーと混ざらない） |
 
 例：
 
@@ -142,6 +143,7 @@ sqlalchemy, python-dotenv, pytest など
 tests/test_cultpass_tools.py::test_cancel_other_users_reservation   … 他人の予約はキャンセルできない
 tests/test_knowledge_search.py::test_unrelated_question_is_not_confident … 関係のない質問は信頼度が低い
 tests/test_memory.py::test_past_context_does_not_mix_users           … 他のユーザーの履歴を混ぜない
+tests/test_memory.py::test_preferences_are_kept_across_tickets       … あるチケットで保存した好みを後のチケットで読み込める
 ```
 
 エンドツーエンドの動作（分類 → ルーティング → 回答 / エスカレーション → 保存）は、`03_agentic_app.ipynb` のシナリオで確かめます。
@@ -182,7 +184,7 @@ solution/
 | RAG と信頼度によるエスカレーション             | `agentic/tools/knowledge_search.py`、Knowledge エージェント      |
 | CultPass DB ツール（2 つ以上、エラー処理つき） | `agentic/tools/cultpass_tools.py`（4 つ）                        |
 | 短期メモリ                                     | LangGraph の `MemorySaver` と `thread_id`（= `ticket_id`）       |
-| 長期メモリ                                     | udahub.db の過去のチケット（`agentic/tools/memory.py`）          |
+| 長期メモリ                                     | udahub.db の過去のチケットと顧客の好み（`agentic/tools/memory.py`） |
 | 構造化され検索できるログ                       | `agentic/logging_utils.py`、`logs/workflow.jsonl`                |
 | テストケース                                   | `tests/`                                                         |
 
@@ -191,6 +193,7 @@ solution/
 - **スーパーバイザー型**：Classifier が司令塔になり、専門エージェントに振り分けます。
 - **信頼度**：`1 − 検索1位の cosine 距離`。実測（関係あり 0.312〜0.659、関係なし 0.136〜0.253）から、しきい値を 0.30 にしました。
 - **ツールの 2 層構造**：本体は dict を返す関数で、例外を投げずに `{"ok": True, "data": ...}` か `{"ok": False, "error": ...}` を返します。LLM 用には `@tool` のラッパーをかぶせています。
+- **顧客の好み**：お客さんがはっきり言った好み（`language`、`interests`、`others`）を Classifier が同じ LLM の呼び出しで拾い、`save_memory` が `customer_preferences` テーブルに保存します。次のチケットでは `load_memory` がそれを読み込みます。Knowledge、Account、Escalation のプロンプトの先頭には共通のルール（`agentic/agents/llm.py` の `PREFERENCE_RULES`）があり、好みは既定の書き方のルールより優先すると書いてあります。ルールは好みの種類に関係しないので、キーを増やしてもエージェントを変える必要はありません。
 - **安全のための工夫**：Account エージェントのツールは、`user_id` を State の値で上書きしてから実行します（他人のデータに触れさせないため）。プロフィールのツールは名前やメールアドレスを返しません。予約のキャンセルは、お客さんに確認してから行います。
 
 ## ライセンス

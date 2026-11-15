@@ -45,6 +45,7 @@ class User(Base):
 
     account = relationship("Account", back_populates="users")
     tickets = relationship("Ticket", back_populates="user")
+    preferences = relationship("CustomerPreference", back_populates="user")
 
     __table_args__ = (
         UniqueConstraint('account_id', 'external_user_id',
@@ -53,6 +54,25 @@ class User(Base):
 
     def __repr__(self):
         return f"<User(user_id='{self.user_id}', user_name='{self.user_name}', external_user_id='{self.external_user_id}')>"
+
+
+class CustomerPreference(Base):
+    """Customer preferences (long-term memory). One row per (user, key).
+
+    pref_key is one of: language / interests / others.
+    Kept across tickets, so the agents can use them in later inquiries.
+    """
+    __tablename__ = 'customer_preferences'
+    user_id = Column(String, ForeignKey('users.user_id'), primary_key=True)
+    pref_key = Column(String, primary_key=True)
+    pref_value = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="preferences")
+
+    def __repr__(self):
+        return f"<CustomerPreference(user_id='{self.user_id}', key='{self.pref_key}', value='{self.pref_value}')>"
 
 
 class Ticket(Base):
